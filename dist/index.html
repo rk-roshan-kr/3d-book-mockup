@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BookStudio 3D - Hyper-Realistic Book Mockup & Photoshoot Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <!-- PDFJS Library for rendering PDF covers in browser -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
+  <script type="module" crossorigin src="/assets/index-OIJbJaxe.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-DwbgNfug.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="logo">
+        <span class="logo-icon">📖</span>
+        <span class="logo-text">BookStudio <span class="logo-accent">3D</span></span>
+      </div>
+      <div class="header-actions">
+        <button id="load-demo-btn" class="btn btn-secondary">
+          <span class="btn-icon">✨</span> Load Demo Cover
+        </button>
+        <button id="export-png-btn" class="btn btn-primary">
+          <span class="btn-icon">📸</span> Capture Render
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Workspace -->
+    <main class="app-workspace">
+      <!-- Left Panel: Book Configurator -->
+      <aside class="sidebar sidebar-left">
+        <div class="sidebar-section">
+          <h3>Cover Design Wrap</h3>
+          <div class="upload-container" id="drop-zone">
+            <input type="file" id="cover-upload" accept="image/*,application/pdf" class="file-input">
+            <div class="upload-prompt">
+              <span class="upload-icon">📤</span>
+              <p class="upload-title">Upload Full Cover Wrap</p>
+              <p class="upload-subtitle">Drag & drop or click to browse</p>
+              <p class="upload-hint">Supports PDF, JPG, PNG (Back + Spine + Front)</p>
+            </div>
+          </div>
+          <div id="cover-preview-wrapper" class="cover-preview-wrapper hidden">
+            <div class="preview-header">
+              <span>Texture Cropping Map</span>
+              <button id="remove-cover-btn" class="btn-close">&times;</button>
+            </div>
+            <div class="crop-preview-container">
+              <img id="cover-preview-img" src="" alt="Cover preview">
+              <div class="crop-guides">
+                <div class="guide-line guide-left"></div>
+                <div class="guide-line guide-right"></div>
+                <div class="guide-label label-back">Back</div>
+                <div class="guide-label label-spine">Spine</div>
+                <div class="guide-label label-front">Front</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="sidebar-section">
+          <h3>Dimension Plan</h3>
+          
+          <div class="form-group">
+            <label>Cover Type</label>
+            <div class="toggle-group">
+              <input type="radio" id="type-hardcover" name="book-type" value="hardcover" checked>
+              <label for="type-hardcover">Hardcover</label>
+              <input type="radio" id="type-paperback" name="book-type" value="paperback">
+              <label for="type-paperback">Paperback</label>
+            </div>
+          </div>
+
+          <div class="form-grid">
+            <div class="form-group">
+              <label for="input-width">Width (in)</label>
+              <input type="number" id="input-width" value="6.0" step="0.1" min="3" max="15">
+            </div>
+            <div class="form-group">
+              <label for="input-height">Height (in)</label>
+              <input type="number" id="input-height" value="9.0" step="0.1" min="4" max="20">
+            </div>
+          </div>
+
+          <div class="form-group">
+            <div class="label-with-val">
+              <label for="input-spine">Spine Width (in)</label>
+              <span class="val-display" id="spine-val">0.558"</span>
+            </div>
+            <input type="range" id="input-spine" min="0.1" max="3.0" step="0.001" value="0.558">
+            <div class="range-helper">Typical: 0.385" (Paperback), 0.558" (Hardcover)</div>
+          </div>
+
+          <div class="form-group">
+            <div class="label-with-val">
+              <label for="input-pages">Page Count</label>
+              <span class="val-display" id="pages-val">164</span>
+            </div>
+            <input type="range" id="input-pages" min="10" max="800" step="1" value="164">
+            <div class="range-helper">Adjusting pages dynamically scales spine width</div>
+          </div>
+        </div>
+
+        <div class="sidebar-section">
+          <h3>Material Finishes</h3>
+          
+          <div class="form-group">
+            <label>Cover Laminate</label>
+            <div class="select-wrapper">
+              <select id="select-finish">
+                <option value="matte" selected>Soft Matte (Silky, non-reflective)</option>
+                <option value="glossy">High Gloss (Polished, reflective)</option>
+                <option value="textured">Linen Cloth / Textured (Fine fabric grain)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Paper Type & Color</label>
+            <div class="select-wrapper">
+              <select id="select-paper">
+                <option value="white" selected>Crisp White (Offset, 50lb)</option>
+                <option value="cream">Aged Cream (Warm, 50lb)</option>
+                <option value="groundwood">Groundwood / Kraft (Yellowish-brown)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Page Edge Finish</label>
+            <div class="edge-options">
+              <button class="edge-dot active" data-edge="standard" title="Standard Paper Edge" style="background: #e5e5e5; border: 2px solid #7c3aed;"></button>
+              <button class="edge-dot" data-edge="gold" title="Gilded Gold Foil" style="background: linear-gradient(135deg, #ffe066 0%, #b38600 100%);"></button>
+              <button class="edge-dot" data-edge="silver" title="Gilded Silver Foil" style="background: linear-gradient(135deg, #e6e6e6 0%, #999999 100%);"></button>
+              <button class="edge-dot" data-edge="black" title="Matte Black Spray" style="background: #1a1a1a;"></button>
+              <button class="edge-dot" data-edge="custom" id="custom-edge-trigger" title="Custom Edge Color" style="background: linear-gradient(45deg, red, orange, yellow, green, blue, purple);"></button>
+            </div>
+            <input type="color" id="input-edge-color" value="#ffffff" class="hidden-color-picker">
+          </div>
+        </div>
+      </aside>
+
+      <!-- Center Panel: 3D Viewport -->
+      <section class="viewport-container">
+        <!-- Floating HUD / View Controls -->
+        <div class="viewport-hud hud-top">
+          <div class="badge badge-accent">Interactive 3D Studio</div>
+          <div class="loading-indicator hidden" id="spinner">
+            <div class="spinner-circle"></div>
+            <span>Processing...</span>
+          </div>
+        </div>
+
+        <div class="viewport-canvas-wrapper" id="canvas-container">
+          <canvas id="webgl-canvas"></canvas>
+          <img id="foreground-overlay" class="foreground-overlay hidden" alt="hands overlay" />
+        </div>
+
+        <div class="viewport-hud hud-bottom">
+          <div class="camera-presets">
+            <button class="btn btn-hud active" data-cam="three-quarter" title="3/4 Isometric View">3/4 View</button>
+            <button class="btn btn-hud" data-cam="front" title="Front Cover View">Front</button>
+            <button class="btn btn-hud" data-cam="spine" title="Spine Details View">Spine</button>
+            <button class="btn btn-hud" data-cam="back" title="Back Cover View">Back</button>
+            <button class="btn btn-hud" data-cam="top" title="Top-down / Lay Flat View">Top Down</button>
+          </div>
+          <div class="hud-controls">
+            <button id="reset-cam-btn" class="btn btn-hud-icon" title="Reset Camera Location">🔄</button>
+            <button id="toggle-grid-btn" class="btn btn-hud-icon" title="Toggle Studio Grid">🌐</button>
+            <button id="toggle-outliner-btn" class="btn btn-hud-icon" title="Scene Outliner">🗂</button>
+          </div>
+        </div>
+        <!-- Scene Outliner (Blender-style Object List) -->
+        <div class="scene-outliner" id="scene-outliner">
+          <div class="outliner-header">
+            <span class="outliner-title">🗂 Scene</span>
+            <button class="outliner-close" id="outliner-close-btn" title="Close">✕</button>
+          </div>
+          <div class="outliner-list" id="outliner-list">
+            <!-- Populated by JS -->
+          </div>
+        </div>
+
+        <!-- Transform Inspector (shows when object selected) -->
+        <div class="transform-inspector hidden" id="transform-inspector">
+          <div class="inspector-header">
+            <span class="inspector-icon" id="inspector-icon">📦</span>
+            <span class="inspector-name" id="inspector-name">Book</span>
+          </div>
+          <div class="inspector-body">
+            <div class="inspector-section">
+              <div class="inspector-label">Position</div>
+              <div class="inspector-row">
+                <label class="axis-label x">X</label><input class="axis-input" id="inp-px" type="number" step="0.1">
+                <label class="axis-label y">Y</label><input class="axis-input" id="inp-py" type="number" step="0.1">
+                <label class="axis-label z">Z</label><input class="axis-input" id="inp-pz" type="number" step="0.1">
+              </div>
+            </div>
+            <div class="inspector-section">
+              <div class="inspector-label">Rotation (°)</div>
+              <div class="inspector-row">
+                <label class="axis-label x">X</label><input class="axis-input" id="inp-rx" type="number" step="1">
+                <label class="axis-label y">Y</label><input class="axis-input" id="inp-ry" type="number" step="1">
+                <label class="axis-label z">Z</label><input class="axis-input" id="inp-rz" type="number" step="1">
+              </div>
+            </div>
+            <div class="inspector-section">
+              <div class="inspector-label">Scale</div>
+              <div class="inspector-row">
+                <label class="axis-label s">S</label><input class="axis-input" id="inp-s" type="number" step="0.05" min="0.01" max="20">
+              </div>
+            </div>
+            <div class="inspector-section">
+              <button class="inspector-btn" id="inspector-reset-btn">↺ Reset Transform</button>
+            </div>
+          </div>
+        </div>
+
+      </section>
+
+      <!-- Right Panel: Studio & Photoshoot -->
+      <aside class="sidebar sidebar-right">
+        <div class="sidebar-section">
+          <h3>Photoshoot Scene Presets</h3>
+          <div class="preset-grid">
+            <button class="preset-card active" data-preset="studio">
+              <div class="preset-icon" style="background: radial-gradient(circle, #f0f0f5 0%, #c8c8d2 100%);"></div>
+              <div class="preset-info">
+                <span class="preset-title">Minimal Studio</span>
+                <span class="preset-desc">Clean softbox lights, white backdrop</span>
+              </div>
+            </button>
+            
+            <button class="preset-card" data-preset="clean-flatlay">
+              <div class="preset-icon" style="background: radial-gradient(circle, #f0f0f0 0%, #e2e2e7 100%);"></div>
+              <div class="preset-info">
+                <span class="preset-title">Aesthetic Flatlay</span>
+                <span class="preset-desc">Lying flat on premium textured paper</span>
+              </div>
+            </button>
+
+            <button class="preset-card" data-preset="concrete-wall">
+              <div class="preset-icon" style="background: linear-gradient(135deg, #d3c2b0 0%, #a69280 100%);"></div>
+              <div class="preset-info">
+                <span class="preset-title">Concrete Leaning Wall</span>
+                <span class="preset-desc">Leaning against sandstone wall, bright sun</span>
+              </div>
+            </button>
+
+            <button class="preset-card" data-preset="hands-blue">
+              <div class="preset-icon" style="background: radial-gradient(circle, #00adef 0%, #0072bc 100%);"></div>
+              <div class="preset-info">
+                <span class="preset-title">Cotton Cover (Hands)</span>
+                <span class="preset-desc">Held in hands against solid blue</span>
+              </div>
+            </button>
+
+            <button class="preset-card" data-preset="hands-sky">
+              <div class="preset-icon" style="background: radial-gradient(circle, #87ceeb 0%, #4682b4 100%);"></div>
+              <div class="preset-info">
+                <span class="preset-title">Brain Food (Sky View)</span>
+                <span class="preset-desc">Held high against a bright sunny sky</span>
+              </div>
+            </button>
+
+            <button class="preset-card" data-preset="wood-angle">
+              <div class="preset-icon" style="background: linear-gradient(135deg, #8b5a2b 0%, #5c3a21 100%);"></div>
+              <div class="preset-info">
+                <span class="preset-title">Oak Table (3D Studio)</span>
+                <span class="preset-desc">3D Table: mug, plant & real shadows</span>
+              </div>
+            </button>
+
+            <button class="preset-card" data-preset="midnight-mood">
+              <div class="preset-icon" style="background: radial-gradient(circle, #1e1b29 0%, #0d0b13 100%);"></div>
+              <div class="preset-info">
+                <span class="preset-title">Midnight Mood</span>
+                <span class="preset-desc">High-contrast, dual rim neon glows</span>
+              </div>
+            </button>
+          </div>
+        </div>
+
+        <div class="sidebar-section">
+          <h3>Lighting Fine-Tuning</h3>
+          
+          <div class="form-group">
+            <div class="label-with-val">
+              <label for="input-light-intensity">Light Intensity</label>
+              <span class="val-display" id="intensity-val">1.2x</span>
+            </div>
+            <input type="range" id="input-light-intensity" min="0.2" max="3.0" step="0.05" value="1.2">
+          </div>
+
+          <div class="form-group">
+            <div class="label-with-val">
+              <label for="input-light-rotation">Light Direction</label>
+              <span class="val-display" id="rotation-val">45°</span>
+            </div>
+            <input type="range" id="input-light-rotation" min="0" max="360" step="1" value="45">
+          </div>
+
+          <div class="form-group">
+            <div class="label-with-val">
+              <label for="input-shadow-softness">Shadow Softness</label>
+              <span class="val-display" id="shadow-val">Medium</span>
+            </div>
+            <input type="range" id="input-shadow-softness" min="0.05" max="1.5" step="0.05" value="0.5">
+          </div>
+        </div>
+
+        <div class="sidebar-section">
+          <h3>Camera Settings</h3>
+          
+          <div class="form-group">
+            <div class="label-with-val">
+              <label for="input-dof">Lens Blur (Depth of Field)</label>
+              <span class="val-display" id="dof-val">Off</span>
+            </div>
+            <input type="range" id="input-dof" min="0" max="100" step="10" value="0">
+          </div>
+
+          <div class="form-group">
+            <div class="label-with-val">
+              <label for="input-fov">Field of View (Focal Length)</label>
+              <span class="val-display" id="fov-val">45° (Portrait)</span>
+            </div>
+            <input type="range" id="input-fov" min="20" max="75" step="1" value="45">
+          </div>
+        </div>
+
+        <div class="sidebar-section">
+          <h3>Export Studio Quality</h3>
+          
+          <div class="form-group">
+            <label>Image Backdrop</label>
+            <div class="select-wrapper">
+              <select id="select-export-bg">
+                <option value="opaque" selected>Keep Studio Background</option>
+                <option value="transparent">Transparent Alpha Channel (PNG)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Resolution Quality</label>
+            <div class="select-wrapper">
+              <select id="select-export-scale">
+                <option value="1">Standard Web (1x Screen DPI)</option>
+                <option value="2" selected>Ultra High-Res 2K (2x Screen DPI)</option>
+                <option value="3">Studio Portfolio 4K (3x Screen DPI)</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </main>
+
+    <!-- Toast Notifications -->
+    <div id="toast" class="toast hidden"></div>
+  </div>
+
+</body>
+</html>
