@@ -1,6 +1,6 @@
 # BookStudio 3D: Hyper-Realistic Book Mockup Generator
 
-Welcome to **BookStudio 3D**, a professional-grade web-based photoshoot studio and 3D mockup generator for book cover designs. This tool is preloaded with your cover designs and configured for the exact dimensions specified in your templates.
+Welcome to **BookStudio 3D**, a professional-grade web-based photoshoot studio and 3D mockup generator for book cover designs. This tool is preloaded with your cover designs and configured for the exact dimensions specified in your templates. 
 
 ## Features
 
