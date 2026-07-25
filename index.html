@@ -23,8 +23,14 @@
         <button id="load-demo-btn" class="btn btn-secondary">
           <span class="btn-icon">✨</span> Load Demo Cover
         </button>
-        <button id="export-png-btn" class="btn btn-primary">
-          <span class="btn-icon">📸</span> Capture Render
+        <button id="export-glb-btn" class="btn btn-secondary" title="Export entire 3D scene for import into Blender">
+          <span class="btn-icon">📦</span> Export to Blender (.glb)
+        </button>
+        <button id="export-png-btn" class="btn btn-secondary" title="Capture current screen snapshot">
+          <span class="btn-icon">📸</span> Snapshot
+        </button>
+        <button id="perfect-render-btn" class="btn btn-primary" title="Render a perfect, professionally framed product mockup" style="background: linear-gradient(135deg, #7c3aed 0%, #a855f7 100%); color: white; border: none; font-weight: 700;">
+          <span class="btn-icon">⭐</span> Perfect Frame
         </button>
       </div>
     </header>
@@ -251,6 +257,14 @@
               </div>
             </button>
 
+            <button class="preset-card" data-preset="concrete-leaning-3d">
+              <div class="preset-icon" style="background: radial-gradient(circle, #8a8580 0%, #524f4c 100%);"></div>
+              <div class="preset-info">
+                <span class="preset-title">Concrete Wall (3D Studio)</span>
+                <span class="preset-desc">3D concrete wall, desk, real sunlight & leaf shadows</span>
+              </div>
+            </button>
+
             <button class="preset-card" data-preset="hands-blue">
               <div class="preset-icon" style="background: radial-gradient(circle, #00adef 0%, #0072bc 100%);"></div>
               <div class="preset-info">
@@ -267,11 +281,43 @@
               </div>
             </button>
 
+            <button class="preset-card" data-preset="hands-cotton">
+              <div class="preset-icon" style="background: radial-gradient(circle, #f3dcd3 0%, #d4a390 100%);"></div>
+              <div class="preset-info">
+                <span class="preset-title">3D Hands Studio (PBR)</span>
+                <span class="preset-desc">Rigged 3D left/right hands holding the book in a virtual studio</span>
+              </div>
+            </button>
+
             <button class="preset-card" data-preset="wood-angle">
               <div class="preset-icon" style="background: linear-gradient(135deg, #8b5a2b 0%, #5c3a21 100%);"></div>
               <div class="preset-info">
                 <span class="preset-title">Oak Table (3D Studio)</span>
                 <span class="preset-desc">3D Table: mug, plant & real shadows</span>
+              </div>
+            </button>
+
+            <button class="preset-card" data-preset="marble-desk">
+              <div class="preset-icon" style="background: linear-gradient(135deg, #e5e5eb 0%, #b2b2be 100%); border: 1px solid rgba(255,255,255,0.1);"></div>
+              <div class="preset-info">
+                <span class="preset-title">Marble Vanity (3D)</span>
+                <span class="preset-desc">Teacup, plant, glasses & marble desk</span>
+              </div>
+            </button>
+
+            <button class="preset-card" data-preset="creative-studio">
+              <div class="preset-icon" style="background: linear-gradient(135deg, #424242 0%, #1a1a1a 100%);"></div>
+              <div class="preset-info">
+                <span class="preset-title">Creative Studio (3D)</span>
+                <span class="preset-desc">Retro camera, pen, glasses & concrete desk</span>
+              </div>
+            </button>
+
+            <button class="preset-card" data-preset="modern-study">
+              <div class="preset-icon" style="background: linear-gradient(135deg, #e8d8c8 0%, #c8b8a8 100%);"></div>
+              <div class="preset-info">
+                <span class="preset-title">Modern Study (3D)</span>
+                <span class="preset-desc">Water bottle, avocado, plant & light desk</span>
               </div>
             </button>
 
@@ -334,6 +380,53 @@
         </div>
 
         <div class="sidebar-section">
+          <h3>Book Placement Alignment</h3>
+          <p class="section-desc" style="font-size: 0.75rem; color: var(--text-muted); margin-top: -8px; line-height: 1.3; margin-bottom: 12px;">
+            Nudge and scale the 3D book to align it perfectly with the hand-held photo templates.
+          </p>
+
+          <div class="form-group">
+            <div class="label-with-val">
+              <label for="input-book-nudge-x">Left / Right (X)</label>
+              <span class="val-display" id="book-nudge-x-val">0.0"</span>
+            </div>
+            <input type="range" id="input-book-nudge-x" min="-2.0" max="2.0" step="0.02" value="0.0">
+          </div>
+
+          <div class="form-group">
+            <div class="label-with-val">
+              <label for="input-book-nudge-y">Up / Down (Y)</label>
+              <span class="val-display" id="book-nudge-y-val">0.0"</span>
+            </div>
+            <input type="range" id="input-book-nudge-y" min="-2.0" max="2.0" step="0.02" value="0.0">
+          </div>
+
+          <div class="form-group">
+            <div class="label-with-val">
+              <label for="input-book-nudge-z">Forward / Back (Z)</label>
+              <span class="val-display" id="book-nudge-z-val">0.0"</span>
+            </div>
+            <input type="range" id="input-book-nudge-z" min="-2.0" max="2.0" step="0.02" value="0.0">
+          </div>
+
+          <div class="form-group">
+            <div class="label-with-val">
+              <label for="input-book-nudge-ry">Rotate (Y Axis)</label>
+              <span class="val-display" id="book-nudge-ry-val">0°</span>
+            </div>
+            <input type="range" id="input-book-nudge-ry" min="-90" max="90" step="1" value="0">
+          </div>
+
+          <div class="form-group">
+            <div class="label-with-val">
+              <label for="input-book-nudge-scale">Scale / Zoom</label>
+              <span class="val-display" id="book-nudge-scale-val">1.0x</span>
+            </div>
+            <input type="range" id="input-book-nudge-scale" min="0.5" max="2.0" step="0.02" value="1.0">
+          </div>
+        </div>
+
+        <div class="sidebar-section">
           <h3>Export Studio Quality</h3>
           
           <div class="form-group">
@@ -356,6 +449,18 @@
               </select>
             </div>
           </div>
+        </div>
+
+        <div class="sidebar-section">
+          <h3>Import / Export Scene Config</h3>
+          <p class="section-desc" style="font-size: 0.75rem; color: var(--text-muted); margin-top: -8px; line-height: 1.3;">
+            Save or load positions, rotations, scales of all 3D props, books, and lights.
+          </p>
+          <div style="display: flex; gap: 8px;">
+            <button id="export-config-btn" class="btn btn-secondary" style="flex: 1; padding: 10px;" title="Export all 3D transforms & options to a JSON file">📤 Export</button>
+            <button id="import-config-btn" class="btn btn-secondary" style="flex: 1; padding: 10px;" title="Import 3D scene configuration from a JSON file">📥 Import</button>
+          </div>
+          <input type="file" id="import-config-file" accept=".json" style="display: none;">
         </div>
       </aside>
     </main>

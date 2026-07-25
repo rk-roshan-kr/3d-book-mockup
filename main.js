@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 
 // --- APPLICATION STATE ---
 const state = {
@@ -31,6 +32,13 @@ const state = {
   dof: 0,
   fov: 45,
   showGrid: false,
+  
+  // Book alignment nudges
+  bookNudgeX: 0.0,
+  bookNudgeY: 0.0,
+  bookNudgeZ: 0.0,
+  bookNudgeRy: 0.0,
+  bookNudgeScale: 1.0,
   
   // Export Settings
   exportBg: 'opaque',    // 'opaque', 'transparent'
@@ -65,7 +73,8 @@ function saveSettings() {
           preset: state.preset, lightIntensity: state.lightIntensity,
           lightRotation: state.lightRotation, shadowSoftness: state.shadowSoftness,
           dof: state.dof, fov: state.fov, showGrid: state.showGrid,
-          exportBg: state.exportBg, exportScale: state.exportScale
+          exportBg: state.exportBg, exportScale: state.exportScale,
+          coverImageSrc: state.coverImageSrc
         },
         objects: {}
       };
@@ -74,7 +83,8 @@ function saveSettings() {
         data.objects.book = {
           px: bookGroup.position.x, py: bookGroup.position.y, pz: bookGroup.position.z,
           rx: bookGroup.rotation.x, ry: bookGroup.rotation.y, rz: bookGroup.rotation.z,
-          s: bookGroup.scale.x, visible: bookGroup.visible
+          s: bookGroup.scale.x, visible: bookGroup.visible,
+          locked: !!bookGroup.userData.locked
         };
       }
       // Save prop transforms
@@ -82,7 +92,8 @@ function saveSettings() {
         data.objects[p.name.toLowerCase()] = {
           px: p.group.position.x, py: p.group.position.y, pz: p.group.position.z,
           rx: p.group.rotation.x, ry: p.group.rotation.y, rz: p.group.rotation.z,
-          s: p.group.scale.x, visible: p.group.visible
+          s: p.group.scale.x, visible: p.group.visible,
+          locked: !!p.group.userData.locked
         };
       });
       localStorage.setItem(LS_KEY, JSON.stringify(data));
@@ -105,6 +116,7 @@ function applySavedTransforms(saved) {
     bookGroup.rotation.set(o.book.rx, o.book.ry, o.book.rz);
     bookGroup.scale.setScalar(o.book.s ?? 1);
     bookGroup.visible = o.book.visible !== false;
+    bookGroup.userData.locked = !!o.book.locked;
   }
   loadedProps.forEach(p => {
     const key = p.name.toLowerCase();
@@ -113,6 +125,7 @@ function applySavedTransforms(saved) {
       p.group.rotation.set(o[key].rx, o[key].ry, o[key].rz);
       p.group.scale.setScalar(o[key].s ?? 1);
       p.group.visible = o[key].visible !== false;
+      p.group.userData.locked = !!o[key].locked;
     }
   });
 }
@@ -125,12 +138,16 @@ let lights = {};
 let gridHelper, polarHelper;
 let leafShadowPlane; // floating plane for casting branch shadows
 let floorPlane;
+let backWallPlane; // back wall of the room
 let wallShadowPlane; // vertical wall shadow catcher plane
 let propsGroup;      // 3D scene props group (mug, plant, pen)
 let loadedProps = []; // list of { group, name } for click-drag interaction
+let handsGroup;       // Group containing interactive 3D hand meshes
+let leftHandModel = null, rightHandModel = null;
 
 // Procedural textures
 let linenBumpTexture, paperBumpTexture, pageEdgeTextureMap = {};
+let concretePhotoTexture = null;
 
 // Default colors
 const paperColors = {
@@ -288,25 +305,36 @@ function generatePageEdgeTexture(colorHex, isVertical = false) {
   return tex;
 }
 
-// Draw a leaf outline to use as branch shadow stencil
+// Draw a leaf outline + window frame grid to use as branch and window shadow stencil
 function generateLeafStencilCanvas() {
   const canvas = document.createElement('canvas');
-  canvas.width = 512;
-  canvas.height = 512;
+  canvas.width = 1024;
+  canvas.height = 1024;
   const ctx = canvas.getContext('2d');
   
-  // Transparent background
-  ctx.clearRect(0, 0, 512, 512);
-  ctx.fillStyle = '#000000'; // shadow blocking area
+  // Transparent background (where light passes through)
+  ctx.clearRect(0, 0, 1024, 1024);
   
-  // Draw a branch with organic leaf shapes
+  // Fill the canvas with solid black (blocked light / shadow areas)
+  ctx.fillStyle = '#000000';
+  
+  // 1. Draw Window Frame Shadow:
+  // We draw vertical frame columns and a horizontal crossbar.
+  // The light's diagonal angle will cast these as beautiful slanted window panes.
+  ctx.fillRect(0, 0, 120, 1024);       // Left frame boundary
+  ctx.fillRect(420, 0, 100, 1024);     // Middle frame column
+  ctx.fillRect(820, 0, 120, 1024);     // Right frame column
+  
+  // Horizontal transom/crossbar
+  ctx.fillRect(0, 360, 1024, 90);
+  
+  // 2. Draw organic leaf branches overlaying the window openings:
+  ctx.save();
   ctx.strokeStyle = '#000000';
-  ctx.lineWidth = 8;
-  
-  // Main stem
+  ctx.lineWidth = 14;
   ctx.beginPath();
-  ctx.moveTo(50, 450);
-  ctx.bezierCurveTo(150, 400, 350, 200, 450, 50);
+  ctx.moveTo(150, 200);
+  ctx.bezierCurveTo(300, 220, 600, 50, 900, 250);
   ctx.stroke();
   
   // Helper to draw a leaf
@@ -314,7 +342,6 @@ function generateLeafStencilCanvas() {
     ctx.save();
     ctx.translate(cx, cy);
     ctx.rotate(angle);
-    
     ctx.beginPath();
     ctx.moveTo(0, 0);
     ctx.bezierCurveTo(length / 3, -width / 2, (length * 2) / 3, -width / 2, length, 0);
@@ -324,14 +351,27 @@ function generateLeafStencilCanvas() {
     ctx.restore();
   }
   
-  // Add leaves along the stem
-  drawLeaf(150, 370, -Math.PI / 4, 80, 30);
-  drawLeaf(200, 330, Math.PI / 6, 75, 28);
-  drawLeaf(250, 280, -Math.PI / 5, 85, 32);
-  drawLeaf(300, 230, Math.PI / 7, 70, 26);
-  drawLeaf(350, 170, -Math.PI / 4.5, 90, 35);
-  drawLeaf(400, 110, Math.PI / 8, 65, 24);
-  drawLeaf(430, 70, -Math.PI / 6, 50, 18);
+  // Add leaves along the branch
+  drawLeaf(300, 195, -Math.PI / 4, 110, 42);
+  drawLeaf(380, 175, Math.PI / 5, 100, 38);
+  drawLeaf(480, 140, -Math.PI / 6, 120, 45);
+  drawLeaf(580, 110, Math.PI / 4, 110, 40);
+  drawLeaf(680, 105, -Math.PI / 5, 130, 48);
+  drawLeaf(760, 130, Math.PI / 6, 95, 36);
+  
+  // Add another smaller secondary branch
+  ctx.lineWidth = 8;
+  ctx.beginPath();
+  ctx.moveTo(500, 550);
+  ctx.bezierCurveTo(600, 580, 800, 500, 1024, 600);
+  ctx.stroke();
+  
+  drawLeaf(620, 570, Math.PI / 4, 80, 30);
+  drawLeaf(720, 560, -Math.PI / 5, 90, 34);
+  drawLeaf(820, 530, Math.PI / 6, 85, 32);
+  drawLeaf(920, 545, -Math.PI / 4, 70, 26);
+  
+  ctx.restore();
   
   return canvas;
 }
@@ -417,6 +457,252 @@ function generateWoodTexture() {
 
   const tex = new THREE.CanvasTexture(canvas);
   return tex;
+}
+
+// Procedural light wood desk texture (Birch/Pine)
+function generateLightWoodTexture() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 1024;
+  canvas.height = 1024;
+  const ctx = canvas.getContext('2d');
+  
+  // Base light birch wood color
+  ctx.fillStyle = '#e8d8c8';
+  ctx.fillRect(0, 0, 1024, 1024);
+  
+  // Draw wood planks
+  const plankWidth = 204.8; // 5 planks
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.04)';
+  for (let i = 0; i < 5; i++) {
+    ctx.fillRect(i * plankWidth, 0, 1.5, 1024);
+  }
+  
+  // Wood grain layers
+  for (let plank = 0; plank < 5; plank++) {
+    const startX = plank * plankWidth;
+    ctx.save();
+    
+    // Set clipping path for the plank
+    ctx.beginPath();
+    ctx.rect(startX, 0, plankWidth, 1024);
+    ctx.clip();
+    
+    // Draw wavy lines
+    ctx.strokeStyle = 'rgba(100, 70, 40, 0.06)';
+    ctx.lineWidth = 1.2;
+    
+    const waveCount = 20 + Math.random() * 12;
+    for (let w = 0; w < waveCount; w++) {
+      const xOffset = startX + (w / waveCount) * plankWidth + (Math.random() - 0.5) * 12;
+      
+      ctx.beginPath();
+      ctx.moveTo(xOffset, 0);
+      let currentX = xOffset;
+      let currentY = 0;
+      while (currentY < 1024) {
+        const nextY = currentY + 50 + Math.random() * 50;
+        const offset = Math.sin(currentY * 0.012 + plank) * 6 + (Math.random() - 0.5) * 1.5;
+        ctx.lineTo(xOffset + offset, nextY);
+        currentY = nextY;
+      }
+      ctx.stroke();
+    }
+    
+    // Draw subtle wood knots
+    if (Math.random() > 0.6) {
+      const knotY = 200 + Math.random() * 600;
+      const knotX = startX + plankWidth / 2 + (Math.random() - 0.5) * 30;
+      
+      ctx.fillStyle = 'rgba(100, 70, 40, 0.1)';
+      ctx.beginPath();
+      ctx.arc(knotX, knotY, 10 + Math.random() * 10, 0, Math.PI * 2);
+      ctx.fill();
+      
+      // Ring swirls
+      ctx.strokeStyle = 'rgba(100, 70, 40, 0.08)';
+      for (let r = 1; r < 4; r++) {
+        ctx.beginPath();
+        ctx.arc(knotX, knotY, r * 15 + Math.random() * 4, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+    
+    ctx.restore();
+  }
+  
+  // Warm soft overlay gradient
+  const grad = ctx.createLinearGradient(0, 0, 1024, 1024);
+  grad.addColorStop(0, 'rgba(255, 255, 255, 0.15)');
+  grad.addColorStop(1, 'rgba(80, 50, 20, 0.08)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 1024, 1024);
+
+  const tex = new THREE.CanvasTexture(canvas);
+  return tex;
+}
+
+// Procedural concrete texture generator
+function generateConcreteTexture(baseColorHex = '#b8b2ac', roughness = 0.6) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 1024;
+  canvas.height = 1024;
+  const ctx = canvas.getContext('2d');
+  
+  // Parse base color to RGB
+  const shorthandRegex = /^#?([a-f\d])([a-f\d])([a-f\d])$/i;
+  const fullHex = baseColorHex.replace(shorthandRegex, (m, r, g, b) => r + r + g + g + b + b);
+  const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(fullHex);
+  const baseRGB = result ? {
+    r: parseInt(result[1], 16),
+    g: parseInt(result[2], 16),
+    b: parseInt(result[3], 16)
+  } : { r: 184, g: 178, b: 172 };
+
+  // 1. Fast direct pixel buffer noise generation
+  const imgData = ctx.createImageData(1024, 1024);
+  const data = imgData.data;
+  for (let i = 0; i < data.length; i += 4) {
+    const noise = (Math.random() - 0.5) * 16;
+    data[i]     = Math.min(255, Math.max(0, baseRGB.r + noise));     // R
+    data[i + 1] = Math.min(255, Math.max(0, baseRGB.g + noise));     // G
+    data[i + 2] = Math.min(255, Math.max(0, baseRGB.b + noise));     // B
+    data[i + 3] = 255;                                               // A
+  }
+  ctx.putImageData(imgData, 0, 0);
+  
+  // 2. Cloudy concrete plaster stains (large organic variations)
+  for (let i = 0; i < 20; i++) {
+    const x = Math.random() * 1024;
+    const y = Math.random() * 1024;
+    const rad = 150 + Math.random() * 200;
+    
+    const grad = ctx.createRadialGradient(x, y, 0, x, y, rad);
+    const isDark = Math.random() > 0.5;
+    const opacity = 0.04 + Math.random() * 0.05;
+    
+    if (isDark) {
+      grad.addColorStop(0, `rgba(40, 35, 30, ${opacity})`);
+    } else {
+      grad.addColorStop(0, `rgba(255, 250, 240, ${opacity})`);
+    }
+    grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(x, y, rad, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  
+  // 3. Micro-scratches & concrete pores
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.07)';
+  ctx.lineWidth = 1.0;
+  for (let i = 0; i < 40; i++) {
+    const x = Math.random() * 1024;
+    const y = Math.random() * 1024;
+    const len = 5 + Math.random() * 15;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x + (Math.random() - 0.5) * len, y + (Math.random() - 0.5) * len);
+    ctx.stroke();
+  }
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(1.5, 1.5);
+  tex.needsUpdate = true;
+  return tex;
+}
+
+// Loads a high-res concrete texture patch from a real photo backdrop
+function loadConcretePhotoTexture() {
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = () => {
+    // Create an offscreen canvas to crop a clean patch of concrete texture
+    const canvas = document.createElement('canvas');
+    canvas.width = 1024;
+    canvas.height = 1024;
+    const ctx = canvas.getContext('2d');
+    
+    // Crop a clean, high-texture 500x500 patch from the top-left area (wall region)
+    // and tile/stretch it onto the 1024x1024 texture canvas
+    ctx.drawImage(img, 100, 100, 500, 500, 0, 0, 1024, 1024);
+    
+    // Overlay pixel-level micro-roughness noise to add physical depth/grain
+    const imgData = ctx.getImageData(0, 0, 1024, 1024);
+    const data = imgData.data;
+    for (let i = 0; i < data.length; i += 4) {
+      const noise = (Math.random() - 0.5) * 8;
+      data[i]     = Math.min(255, Math.max(0, data[i] + noise));
+      data[i + 1] = Math.min(255, Math.max(0, data[i + 1] + noise));
+      data[i + 2] = Math.min(255, Math.max(0, data[i + 2] + noise));
+    }
+    ctx.putImageData(imgData, 0, 0);
+
+    concretePhotoTexture = new THREE.CanvasTexture(canvas);
+    concretePhotoTexture.colorSpace = THREE.SRGBColorSpace;
+    concretePhotoTexture.wrapS = THREE.RepeatWrapping;
+    concretePhotoTexture.wrapT = THREE.RepeatWrapping;
+    concretePhotoTexture.repeat.set(1.8, 1.8);
+    concretePhotoTexture.needsUpdate = true;
+    
+    // Re-apply preset if concrete-leaning-3d is active to refresh textures
+    if (state.preset === 'concrete-leaning-3d' || state.preset === 'creative-studio') {
+      applyPreset();
+    }
+  };
+  img.onerror = (err) => {
+    console.error('Failed to load concrete photo backdrop for texture map', err);
+  };
+  img.src = 'backdrop_concrete_wall.png';
+}
+
+// Asynchronously loads and sets up rigged left and right 3D hand models
+function loadHandModels() {
+  const loader = new GLTFLoader();
+  const skinMaterial = new THREE.MeshStandardMaterial({
+    color: 0xeadbc8, // realistic warm light skin tone
+    roughness: 0.65,
+    metalness: 0.0
+  });
+
+  loader.load('left_hand.glb', (gltf) => {
+    leftHandModel = gltf.scene;
+    leftHandModel.traverse(child => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+        child.material = skinMaterial;
+      }
+    });
+    console.log('3D Left Hand model loaded successfully.');
+    if (state.preset === 'hands-cotton') {
+      applyPreset();
+      rebuildBook();
+    }
+  }, undefined, (err) => {
+    console.warn('left_hand.glb failed to load:', err);
+  });
+
+  loader.load('right_hand.glb', (gltf) => {
+    rightHandModel = gltf.scene;
+    rightHandModel.traverse(child => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+        child.material = skinMaterial;
+      }
+    });
+    console.log('3D Right Hand model loaded successfully.');
+    if (state.preset === 'hands-cotton') {
+      applyPreset();
+      rebuildBook();
+    }
+  }, undefined, (err) => {
+    console.warn('right_hand.glb failed to load:', err);
+  });
 }
 
 // --- COVER SPLITTING SYSTEM ---
@@ -587,21 +873,22 @@ function updateCropPreviewUI(spineStartPct, spineEndPct, backStartPct, frontEndP
   }
 }
 
-// Load high-quality GLB 3D models and simple fallback props into the scene
+
+// Setup and load 3D props (cup, plant, camera, glasses, bottle, avocado, pen)
 function create3DProps() {
   if (!propsGroup) return;
 
   loadedProps = [];
   const loader = new GLTFLoader();
 
-  // -- 1. Load real Khronos GLB Plant model (DiffuseTransmissionPlant) --
+  // -- 1. Load real Khronos GLB Plant model --
   const plantGroup = new THREE.Group();
-  plantGroup.position.set(-4.5, 0, -3.0);
-  plantGroup.scale.set(2.2, 2.2, 2.2);
+  plantGroup.position.set(-4.0, 0, -2.8);
+  plantGroup.scale.set(1.0, 1.0, 1.0);
   propsGroup.add(plantGroup);
   loadedProps.push({ group: plantGroup, name: 'Plant' });
 
-  loader.load('/plant.glb', (gltf) => {
+  loader.load('plant.glb', (gltf) => {
     const model = gltf.scene;
     model.traverse(child => {
       if (child.isMesh) {
@@ -609,6 +896,7 @@ function create3DProps() {
         child.receiveShadow = true;
       }
     });
+    fitModelToMaxDimension(model, 8.0); // Target exactly 8.0 inches longest dimension
     // Center model at base
     const box = new THREE.Box3().setFromObject(model);
     const center = box.getCenter(new THREE.Vector3());
@@ -616,6 +904,7 @@ function create3DProps() {
     plantGroup.add(model);
   }, undefined, (err) => {
     console.warn('plant.glb failed, using fallback', err);
+    showToast(`⚠️ Plant GLB failed to parse/load: ${err?.message || err?.type || 'Format/Network error'}`);
     // Fallback terracotta pot
     const potMesh = new THREE.Mesh(
       new THREE.CylinderGeometry(0.4, 0.28, 0.7, 16),
@@ -629,11 +918,11 @@ function create3DProps() {
   // -- 2. Load real Khronos GLB Teacup model (DiffuseTransmissionTeacup) --
   const cupGroup = new THREE.Group();
   cupGroup.position.set(5.0, 0, -2.5);
-  cupGroup.scale.set(3.5, 3.5, 3.5);
+  cupGroup.scale.set(1.0, 1.0, 1.0);
   propsGroup.add(cupGroup);
   loadedProps.push({ group: cupGroup, name: 'Teacup' });
 
-  loader.load('/teacup.glb', (gltf) => {
+  loader.load('teacup.glb', (gltf) => {
     const model = gltf.scene;
     model.traverse(child => {
       if (child.isMesh) {
@@ -641,6 +930,7 @@ function create3DProps() {
         child.receiveShadow = true;
       }
     });
+    fitModelToMaxDimension(model, 3.6); // Target exactly 3.6 inches longest dimension
     // Center model at base
     const box = new THREE.Box3().setFromObject(model);
     const center = box.getCenter(new THREE.Vector3());
@@ -648,6 +938,7 @@ function create3DProps() {
     cupGroup.add(model);
   }, undefined, (err) => {
     console.warn('teacup.glb failed, using fallback', err);
+    showToast(`⚠️ Teacup GLB failed to parse/load: ${err?.message || err?.type || 'Format/Network error'}`);
     // Fallback white mug
     const mugMat = new THREE.MeshStandardMaterial({ color: 0xfefefe, roughness: 0.15 });
     const body = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.35, 0.9, 32), mugMat);
@@ -660,9 +951,170 @@ function create3DProps() {
     cupGroup.add(handle);
   });
 
-  // -- 3. Brass Pen (keep procedural - looks fine) --
+  // -- 3. Load Glasses model --
+  const glassesGroup = new THREE.Group();
+  glassesGroup.position.set(2.5, 0.05, 1.8);
+  glassesGroup.rotation.set(0, -0.4, 0);
+  glassesGroup.scale.set(1.0, 1.0, 1.0);
+  propsGroup.add(glassesGroup);
+  loadedProps.push({ group: glassesGroup, name: 'Glasses' });
+
+  loader.load('glasses.glb', (gltf) => {
+    const model = gltf.scene;
+    model.traverse(child => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+      }
+    });
+    fitModelToMaxDimension(model, 5.5); // Target exactly 5.5 inches width
+    // Center model at base
+    const box = new THREE.Box3().setFromObject(model);
+    const center = box.getCenter(new THREE.Vector3());
+    model.position.set(-center.x, -box.min.y, -center.z);
+    glassesGroup.add(model);
+  }, undefined, (err) => {
+    console.warn('glasses.glb failed, using fallback', err);
+    showToast(`⚠️ Glasses GLB failed to parse/load: ${err?.message || err?.type || 'Format/Network error'}`);
+    // Fallback eyeglasses
+    const glassMat = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.2, metalness: 0.8 });
+    const lensMat = new THREE.MeshPhysicalMaterial({ color: 0xffffff, transparent: true, opacity: 0.3, roughness: 0.1 });
+    // Left eye ring
+    const leftRing = new THREE.Mesh(new THREE.TorusGeometry(0.2, 0.03, 8, 24), glassMat);
+    leftRing.position.set(-0.25, 0.2, 0);
+    glassesGroup.add(leftRing);
+    const leftLens = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, 0.02, 16), lensMat);
+    leftLens.rotation.x = Math.PI / 2;
+    leftLens.position.set(-0.25, 0.2, 0);
+    glassesGroup.add(leftLens);
+    // Right eye ring
+    const rightRing = new THREE.Mesh(new THREE.TorusGeometry(0.2, 0.03, 8, 24), glassMat);
+    rightRing.position.set(0.25, 0.2, 0);
+    glassesGroup.add(rightRing);
+    const rightLens = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, 0.02, 16), lensMat);
+    rightLens.rotation.x = Math.PI / 2;
+    rightLens.position.set(0.25, 0.2, 0);
+    glassesGroup.add(rightLens);
+    // Bridge
+    const bridge = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.02, 0.14), glassMat);
+    bridge.rotation.z = Math.PI / 2;
+    bridge.position.set(0, 0.22, 0);
+    glassesGroup.add(bridge);
+  });
+
+  // -- 4. Load Antique Camera model --
+  const cameraGroup = new THREE.Group();
+  cameraGroup.position.set(-3.5, 0, 2.5);
+  cameraGroup.rotation.set(0, 0.6, 0);
+  cameraGroup.scale.set(1.0, 1.0, 1.0);
+  propsGroup.add(cameraGroup);
+  loadedProps.push({ group: cameraGroup, name: 'Camera' });
+
+  loader.load('antique_camera.glb', (gltf) => {
+    const model = gltf.scene;
+    model.traverse(child => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+      }
+    });
+    fitModelToMaxDimension(model, 5.2); // Target exactly 5.2 inches width
+    // Center model at base
+    const box = new THREE.Box3().setFromObject(model);
+    const center = box.getCenter(new THREE.Vector3());
+    model.position.set(-center.x, -box.min.y, -center.z);
+    cameraGroup.add(model);
+  }, undefined, (err) => {
+    console.warn('antique_camera.glb failed, using fallback', err);
+    showToast(`⚠️ Camera GLB failed to parse/load: ${err?.message || err?.type || 'Format/Network error'}`);
+    // Fallback camera
+    const camBodyMat = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.7 });
+    const camLensMat = new THREE.MeshStandardMaterial({ color: 0x111111, metalness: 0.9, roughness: 0.1 });
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.5, 0.4), camBodyMat);
+    body.position.y = 0.25;
+    body.castShadow = true;
+    cameraGroup.add(body);
+    const lens = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, 0.3, 24), camLensMat);
+    lens.rotation.x = Math.PI / 2;
+    lens.position.set(0, 0.25, 0.25);
+    lens.castShadow = true;
+    cameraGroup.add(lens);
+  });
+
+  // -- 5. Load Water Bottle model --
+  const bottleGroup = new THREE.Group();
+  bottleGroup.position.set(4.5, 0, 1.2);
+  bottleGroup.scale.set(1.0, 1.0, 1.0);
+  propsGroup.add(bottleGroup);
+  loadedProps.push({ group: bottleGroup, name: 'Bottle' });
+
+  loader.load('water_bottle.glb', (gltf) => {
+    const model = gltf.scene;
+    model.traverse(child => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+      }
+    });
+    fitModelToMaxDimension(model, 8.5); // Target exactly 8.5 inches height
+    // Center model at base
+    const box = new THREE.Box3().setFromObject(model);
+    const center = box.getCenter(new THREE.Vector3());
+    model.position.set(-center.x, -box.min.y, -center.z);
+    bottleGroup.add(model);
+  }, undefined, (err) => {
+    console.warn('water_bottle.glb failed, using fallback', err);
+    showToast(`⚠️ Water Bottle GLB failed to parse/load: ${err?.message || err?.type || 'Format/Network error'}`);
+    // Fallback sports bottle
+    const botMat = new THREE.MeshPhysicalMaterial({ color: 0x0284c7, roughness: 0.2, metalness: 0.1, clearcoat: 1.0 });
+    const capMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.5 });
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.25, 0.9, 24), botMat);
+    body.position.y = 0.45;
+    body.castShadow = true;
+    bottleGroup.add(body);
+    const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 0.15, 24), capMat);
+    cap.position.y = 0.955;
+    cap.castShadow = true;
+    bottleGroup.add(cap);
+  });
+
+  // -- 6. Load Avocado model --
+  const avocadoGroup = new THREE.Group();
+  avocadoGroup.position.set(-2.0, 0, 3.5);
+  avocadoGroup.rotation.set(0.2, 0.8, -0.1);
+  avocadoGroup.scale.set(1.0, 1.0, 1.0);
+  propsGroup.add(avocadoGroup);
+  loadedProps.push({ group: avocadoGroup, name: 'Avocado' });
+
+  loader.load('avocado.glb', (gltf) => {
+    const model = gltf.scene;
+    model.traverse(child => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+      }
+    });
+    fitModelToMaxDimension(model, 4.0); // Target exactly 4.0 inches length
+    // Center model at base
+    const box = new THREE.Box3().setFromObject(model);
+    const center = box.getCenter(new THREE.Vector3());
+    model.position.set(-center.x, -box.min.y, -center.z);
+    avocadoGroup.add(model);
+  }, undefined, (err) => {
+    console.warn('avocado.glb failed, using fallback', err);
+    showToast(`⚠️ Avocado GLB failed to parse/load: ${err?.message || err?.type || 'Format/Network error'}`);
+    // Fallback avocado sphere
+    const avoMat = new THREE.MeshStandardMaterial({ color: 0x1e3a1e, roughness: 0.9 });
+    const body = new THREE.Mesh(new THREE.SphereGeometry(0.2, 16, 16), avoMat);
+    body.scale.set(1, 1.4, 1);
+    body.position.y = 0.2;
+    body.castShadow = true;
+    avocadoGroup.add(body);
+  });
+
+  // -- 7. Brass Pen (lengthened to standard 5.8 inches) --
   const penGroup = new THREE.Group();
-  const penGeom = new THREE.CylinderGeometry(0.06, 0.05, 2.2, 12);
+  const penGeom = new THREE.CylinderGeometry(0.06, 0.05, 5.5, 12);
   const penMat = new THREE.MeshStandardMaterial({ color: 0xca8a04, metalness: 0.92, roughness: 0.15 });
   const penMesh = new THREE.Mesh(penGeom, penMat);
   penMesh.rotation.x = Math.PI / 2;
@@ -671,15 +1123,127 @@ function create3DProps() {
   penGroup.add(penMesh);
   // Pen tip
   const tipMesh = new THREE.Mesh(
-    new THREE.ConeGeometry(0.05, 0.15, 12),
+    new THREE.ConeGeometry(0.05, 0.3, 12),
     new THREE.MeshStandardMaterial({ color: 0x1a1a1a, metalness: 0.8, roughness: 0.2 })
   );
-  tipMesh.position.z = -1.175;
+  tipMesh.position.z = -2.875;
   tipMesh.rotation.x = -Math.PI / 2;
   penGroup.add(tipMesh);
   penGroup.position.set(1.8, 0.06, 3.2);
   propsGroup.add(penGroup);
   loadedProps.push({ group: penGroup, name: 'Pen' });
+
+  // -- 8. Load Scale model --
+  const scaleGroup = new THREE.Group();
+  scaleGroup.position.set(-5.0, 0, 1.0);
+  scaleGroup.scale.set(1.0, 1.0, 1.0);
+  propsGroup.add(scaleGroup);
+  loadedProps.push({ group: scaleGroup, name: 'Scale' });
+
+  loader.load('arunangshubanerjee-scale-1599.glb', (gltf) => {
+    const model = gltf.scene;
+    model.traverse(child => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+      }
+    });
+    fitModelToMaxDimension(model, 7.0); // Target 7.0 inches
+    const box = new THREE.Box3().setFromObject(model);
+    const center = box.getCenter(new THREE.Vector3());
+    model.position.set(-center.x, -box.min.y, -center.z);
+    scaleGroup.add(model);
+  }, undefined, (err) => {
+    console.warn('scale glb failed, using fallback', err);
+    showToast(`⚠️ Scale GLB failed to parse/load: ${err?.message || err?.type || 'Format/Network error'}`);
+    // Fallback scale
+    const brassMat = new THREE.MeshStandardMaterial({ color: 0xca8a04, metalness: 0.9, roughness: 0.2 });
+    const post = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 2.0), brassMat);
+    post.position.y = 1.0;
+    post.castShadow = true;
+    scaleGroup.add(post);
+    const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 1.8), brassMat);
+    beam.rotation.z = Math.PI / 2;
+    beam.position.y = 1.9;
+    beam.castShadow = true;
+    scaleGroup.add(beam);
+  });
+
+  // -- 9. Load Armchair model --
+  const armchairGroup = new THREE.Group();
+  armchairGroup.position.set(-8.0, 0, -7.0);
+  armchairGroup.rotation.set(0, 0.5, 0);
+  armchairGroup.scale.set(1.0, 1.0, 1.0);
+  propsGroup.add(armchairGroup);
+  loadedProps.push({ group: armchairGroup, name: 'Armchair' });
+
+  loader.load('denielcz-armchair-2924.glb', (gltf) => {
+    const model = gltf.scene;
+    model.traverse(child => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+      }
+    });
+    fitModelToMaxDimension(model, 36.0); // Large armchair!
+    const box = new THREE.Box3().setFromObject(model);
+    const center = box.getCenter(new THREE.Vector3());
+    model.position.set(-center.x, -box.min.y, -center.z);
+    armchairGroup.add(model);
+  }, undefined, (err) => {
+    console.warn('armchair glb failed, using fallback', err);
+    showToast(`⚠️ Armchair GLB failed to parse/load: ${err?.message || err?.type || 'Format/Network error'}`);
+    // Fallback armchair
+    const fabricMat = new THREE.MeshStandardMaterial({ color: 0x3b82f6, roughness: 0.9 });
+    const seat = new THREE.Mesh(new THREE.BoxGeometry(2.5, 0.8, 2.5), fabricMat);
+    seat.position.y = 0.8;
+    seat.castShadow = true;
+    armchairGroup.add(seat);
+    const back = new THREE.Mesh(new THREE.BoxGeometry(2.5, 2.0, 0.6), fabricMat);
+    back.position.set(0, 1.8, -1.0);
+    back.castShadow = true;
+    armchairGroup.add(back);
+  });
+
+  // -- 10. Load Lantern model --
+  const lanternGroup = new THREE.Group();
+  lanternGroup.position.set(5.5, 0, 1.5);
+  lanternGroup.scale.set(1.0, 1.0, 1.0);
+  propsGroup.add(lanternGroup);
+  loadedProps.push({ group: lanternGroup, name: 'Lantern' });
+
+  loader.load('pixellabs-lantern-3333.glb', (gltf) => {
+    const model = gltf.scene;
+    model.traverse(child => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+      }
+    });
+    fitModelToMaxDimension(model, 10.0); // 10 inches tall
+    const box = new THREE.Box3().setFromObject(model);
+    const center = box.getCenter(new THREE.Vector3());
+    model.position.set(-center.x, -box.min.y, -center.z);
+    lanternGroup.add(model);
+  }, undefined, (err) => {
+    console.warn('lantern glb failed, using fallback', err);
+    showToast(`⚠️ Lantern GLB failed to parse/load: ${err?.message || err?.type || 'Format/Network error'}`);
+    // Fallback lantern
+    const metalMat = new THREE.MeshStandardMaterial({ color: 0x475569, metalness: 0.8, roughness: 0.3 });
+    const glassMat = new THREE.MeshPhysicalMaterial({ color: 0xffffff, transparent: true, opacity: 0.4, roughness: 0.1 });
+    const base = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.3, 0.2, 16), metalMat);
+    base.position.y = 0.1;
+    base.castShadow = true;
+    lanternGroup.add(base);
+    const chamber = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.22, 0.5, 16), glassMat);
+    chamber.position.y = 0.45;
+    chamber.castShadow = true;
+    lanternGroup.add(chamber);
+    const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.26, 0.15, 16), metalMat);
+    cap.position.y = 0.775;
+    cap.castShadow = true;
+    lanternGroup.add(cap);
+  });
 
   // Hide by default (shown only in wood-angle 3D scene)
   propsGroup.visible = false;
@@ -691,8 +1255,18 @@ function create3DProps() {
 function rebuildBook() {
   if (!scene) return;
   
+  let oldUserData = {};
+  let oldPos, oldRot, oldScale;
+  let oldVisible = true;
+  
   // Remove old group
   if (bookGroup) {
+    oldUserData = Object.assign({}, bookGroup.userData);
+    oldPos = bookGroup.position.clone();
+    oldRot = bookGroup.rotation.clone();
+    oldScale = bookGroup.scale.clone();
+    oldVisible = bookGroup.visible;
+
     scene.remove(bookGroup);
     // Recursively dispose geometry and materials
     bookGroup.traverse(child => {
@@ -708,6 +1282,8 @@ function rebuildBook() {
   }
 
   bookGroup = new THREE.Group();
+  bookGroup.userData = oldUserData;
+  bookGroup.visible = oldVisible;
   bookGroup.castShadow = true;
   bookGroup.receiveShadow = true;
 
@@ -718,8 +1294,14 @@ function rebuildBook() {
     createPaperbackMesh();
   }
 
-  // Adjust book position based on composition preset
-  applyComposition();
+  if (oldPos) {
+    bookGroup.position.copy(oldPos);
+    bookGroup.rotation.copy(oldRot);
+    bookGroup.scale.copy(oldScale);
+  } else {
+    // Adjust book position based on composition preset
+    applyComposition();
+  }
 
   scene.add(bookGroup);
 }
@@ -830,6 +1412,22 @@ function createPaperbackMesh() {
       } else {
         v.z -= puffOffset;
       }
+    }
+    
+    // 3. Hand-held paperback cylindrical curve / bend
+    let curveAmount = 0.0;
+    if (state.preset === 'hands-cotton') {
+      curveAmount = 0.40; // Significant flex for Cotton Cover (Hand)
+    } else if (state.preset === 'hands-blue') {
+      curveAmount = 0.16; // Medium flex
+    } else if (state.preset === 'hands-sky') {
+      curveAmount = 0.06; // Gentle flex
+    }
+    
+    if (curveAmount > 0.001) {
+      const normX = v.x / (w / 2); // -1.0 to 1.0
+      const bend = curveAmount * Math.pow(normX, 2);
+      v.z += bend;
     }
     
     posAttr.setXYZ(i, v.x, v.y, v.z);
@@ -1029,13 +1627,116 @@ function createHardcoverMesh() {
   bookGroup.add(backHinge);
 }
 
-// Map presets to their photorealistic backdrops
 const presetBackdrops = {
   'clean-flatlay': '/backdrop_clean_flatlay.png',
   'concrete-wall': '/backdrop_concrete_wall.png',
   'hands-blue': '/backdrop_hands_blue.png',
   'hands-sky': '/backdrop_hands_sky.png'
 };
+
+// Automatically positions book and camera to match backdrop photography angles
+// Frame the camera dynamically on the book using responsive bounding box projection
+function frameCameraOnBook(pre) {
+  if (!camera || !controls || !bookGroup) return;
+
+  const box = new THREE.Box3().setFromObject(bookGroup);
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z);
+  const fovRad = (camera.fov * Math.PI) / 180;
+  
+  let dist = (maxDim / 2) / Math.tan(fovRad / 2);
+  
+  let targetPos = new THREE.Vector3();
+  let targetCtr = center.clone();
+  
+  if (pre === 'hands-blue') {
+    targetPos.set(0.0, 1.8, 13.5);
+    targetCtr.set(-0.2, 1.3, 0);
+  } else if (pre === 'hands-sky') {
+    targetPos.set(0.0, 2.2, 13.0);
+    targetCtr.set(0, 1.6, 0);
+  } else {
+    let dir = new THREE.Vector3();
+    let zoomMultiplier = 1.35;
+    
+    if (pre === 'clean-flatlay') {
+      dir.set(0.3, 0.9, 0.3).normalize();
+      zoomMultiplier = 1.4;
+    } else if (pre === 'concrete-wall' || pre === 'concrete-leaning-3d') {
+      dir.set(0.5, 0.25, 0.83).normalize();
+      zoomMultiplier = 1.35;
+    } else if (pre === 'wood-angle') {
+      dir.set(0.42, 0.62, 0.66).normalize();
+      zoomMultiplier = 1.3;
+    } else if (pre === 'marble-desk') {
+      dir.set(-0.45, 0.55, 0.70).normalize();
+      zoomMultiplier = 1.3;
+    } else if (pre === 'creative-studio') {
+      dir.set(0.5, 0.35, 0.78).normalize();
+      zoomMultiplier = 1.35;
+    } else if (pre === 'modern-study') {
+      dir.set(0.53, 0.42, 0.73).normalize();
+      zoomMultiplier = 1.35;
+    } else { // studio or midnight-mood
+      dir.set(0.55, 0.4, 0.73).normalize();
+      zoomMultiplier = 1.3;
+    }
+    
+    targetPos.copy(targetCtr).addScaledVector(dir, dist * zoomMultiplier);
+  }
+  
+  camera.position.copy(targetPos);
+  controls.target.copy(targetCtr);
+  controls.update();
+}
+
+// Positions the 3D hand models to grip the book edges in real-time
+function update3DHands() {
+  if (!handsGroup) return;
+
+  const pre = state.preset;
+  if (pre !== 'hands-cotton') {
+    handsGroup.visible = false;
+    return;
+  }
+
+  handsGroup.visible = true;
+  handsGroup.clear();
+
+  // Position handsGroup to match the bookGroup transforms exactly
+  if (bookGroup) {
+    handsGroup.position.copy(bookGroup.position);
+    handsGroup.rotation.copy(bookGroup.rotation);
+    handsGroup.scale.copy(bookGroup.scale);
+  }
+
+  const w = state.width * INCH_TO_THREE;
+  const h = state.height * INCH_TO_THREE;
+  const d = state.spineWidth * INCH_TO_THREE;
+  const bt = state.boardThickness * INCH_TO_THREE;
+  const thickness = state.bookType === 'hardcover' ? (d + 2 * bt) : d;
+
+  // Let's place the left hand model (holding the spine / back cover)
+  if (leftHandModel) {
+    // left hand positioned on left edge
+    leftHandModel.position.set(-w / 2 - 0.6, h / 2 - 3.2, 0.6);
+    // rotate it to look like it's grasping the cover
+    leftHandModel.rotation.set(Math.PI / 2.2, Math.PI / 4, -Math.PI / 12);
+    leftHandModel.scale.setScalar(26.0);
+    handsGroup.add(leftHandModel);
+  }
+
+  // Let's place the right hand model (holding the front cover / page edges)
+  if (rightHandModel) {
+    // right hand positioned on right edge
+    rightHandModel.position.set(w / 2 + 0.6, h / 2 - 3.2, 0.6);
+    // rotate it to grasp the page edge
+    rightHandModel.rotation.set(Math.PI / 2.2, -Math.PI / 4, Math.PI / 12);
+    rightHandModel.scale.setScalar(26.0);
+    handsGroup.add(rightHandModel);
+  }
+}
 
 // Automatically positions book and camera to match backdrop photography angles
 function alignPresetCamera() {
@@ -1061,78 +1762,81 @@ function alignPresetCamera() {
 
   if (pre === 'clean-flatlay') {
     state.composition = 'lying';
-    
-    // Position book flat on table, matching the angle of the wood grain
     bookGroup.rotation.x = -Math.PI / 2;
     bookGroup.rotation.z = Math.PI / 6;
     bookGroup.position.set(-0.3, thickness / 2, 0.2);
 
-    // Setup camera to match 3/4 perspective of backdrop image
-    camera.position.set(2.2, 3.8, 4.4);
-    controls.target.set(0, 0.2, 0);
-    controls.update();
-
-  } else if (pre === 'concrete-wall') {
+  } else if (pre === 'concrete-wall' || pre === 'concrete-leaning-3d') {
     state.composition = 'standing';
-    
-    // Tilted back leaning against the sandstone wall
     bookGroup.rotation.x = -0.15;
     bookGroup.rotation.y = -0.3;
     bookGroup.rotation.z = 0;
     bookGroup.position.set(-w / 2 - 0.2, 0.05, -0.2);
 
-    // Low angle shot looking up at leaning book
-    camera.position.set(2.6, 2.0, 4.5);
-    controls.target.set(0, 1.2, 0);
-    controls.update();
-
   } else if (pre === 'hands-blue') {
     state.composition = 'standing';
-    
-    // Position book in hands center at correct tilt
-    bookGroup.rotation.x = 0.22;
-    bookGroup.rotation.y = -0.52;
-    bookGroup.rotation.z = -0.15;
-    bookGroup.position.set(-w / 2 - 0.2, 0.45, 0.15);
-
-    // Zoom camera out (distance = 13.5) to match the book size in background image
-    camera.position.set(0.0, 1.8, 13.5);
-    controls.target.set(-0.2, 1.3, 0);
-    controls.update();
+    bookGroup.rotation.x = 0.28;
+    bookGroup.rotation.y = -0.45;
+    bookGroup.rotation.z = -0.12;
+    bookGroup.position.set(-w / 2 + 0.1, 0.65, 0.45);
 
   } else if (pre === 'hands-sky') {
     state.composition = 'standing';
-    
-    // Angle the book model facing forward held up against sky
     bookGroup.rotation.x = 0.02;
     bookGroup.rotation.y = -0.05;
     bookGroup.rotation.z = 0.0;
     bookGroup.position.set(-w / 2, 0.95, 0.0);
 
-    // Zoom camera out (distance = 13.0) to match sky background book
-    camera.position.set(0.0, 2.2, 13.0);
-    controls.target.set(0, 1.6, 0);
-    controls.update();
+  } else if (pre === 'hands-cotton') {
+    state.composition = 'standing';
+    bookGroup.rotation.x = 0.15;
+    bookGroup.rotation.y = -0.40;
+    bookGroup.rotation.z = -0.05;
+    bookGroup.position.set(-w / 2, 1.25, 0.15);
 
   } else if (pre === 'wood-angle') {
     state.composition = 'lying';
-    
     bookGroup.rotation.x = -Math.PI / 2;
     bookGroup.rotation.z = Math.PI / 6;
     bookGroup.position.set(-0.3, thickness / 2, 0.2);
 
-    camera.position.set(2.4, 3.5, 4.5);
-    controls.target.set(0, 0, 0);
-    controls.update();
+  } else if (pre === 'marble-desk') {
+    state.composition = 'lying';
+    bookGroup.rotation.x = -Math.PI / 2;
+    bookGroup.rotation.z = -Math.PI / 4;
+    bookGroup.position.set(-0.2, thickness / 2, -0.4);
+
+  } else if (pre === 'creative-studio') {
+    state.composition = 'standing';
+    bookGroup.rotation.x = 0;
+    bookGroup.rotation.y = 0.45;
+    bookGroup.rotation.z = 0;
+    bookGroup.position.set(-w / 2, 0, 0.5);
+
+  } else if (pre === 'modern-study') {
+    state.composition = 'standing';
+    bookGroup.rotation.x = 0.1;
+    bookGroup.rotation.y = -0.3;
+    bookGroup.rotation.z = -0.05;
+    bookGroup.position.set(-w / 2 + 0.2, 0, -0.2);
 
   } else if (pre === 'studio' || pre === 'midnight-mood') {
     state.composition = 'standing';
     bookGroup.position.set(-w / 2, 0, 0);
-    
-    camera.position.set(4.5, 3.5, 5.0);
-    controls.target.set(0, 0.8, 0);
-    controls.update();
   }
+
+  // Apply manual user nudges (alignment offset adjustments)
+  bookGroup.position.x += state.bookNudgeX;
+  bookGroup.position.y += state.bookNudgeY;
+  bookGroup.position.z += state.bookNudgeZ;
+  bookGroup.rotation.y += (state.bookNudgeRy * Math.PI) / 180;
+  bookGroup.scale.setScalar(state.bookNudgeScale);
+
+  // Sync handsGroup transforms to match the book
+  update3DHands();
+
+  // Frame the camera perfectly
+  frameCameraOnBook(pre);
 }
 
 // --- BOOK COMPOSITION PLACEMENTS ---
@@ -1141,6 +1845,85 @@ function applyComposition() {
 }
 
 // --- PHOTOSHOOT PRESETS & LIGHTING ---
+
+const propPresetDefaults = {
+  'wood-angle': {
+    'plant': { px: -4.0, py: 0, pz: -2.8, rx: 0, ry: 0, rz: 0, s: 1.0, visible: true },
+    'teacup': { px: 5.0, py: 0, pz: -2.5, rx: 0, ry: 0, rz: 0, s: 1.0, visible: true },
+    'pen': { px: 1.8, py: 0.06, pz: 3.2, rx: 0, ry: 0, rz: 0, s: 1.0, visible: true },
+    'glasses': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'camera': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'bottle': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'avocado': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'scale': { px: -5.0, py: 0, pz: 1.0, rx: 0, ry: 0.2, rz: 0, s: 1.0, visible: true },
+    'armchair': { px: -9.5, py: 0, pz: -8.0, rx: 0, ry: 0.5, rz: 0, s: 1.0, visible: true },
+    'lantern': { px: 5.5, py: 0, pz: 1.5, rx: 0, ry: -0.3, rz: 0, s: 1.0, visible: true }
+  },
+  'marble-desk': {
+    'plant': { px: 4.5, py: 0, pz: -3.2, rx: 0, ry: 0, rz: 0, s: 1.0, visible: true },
+    'teacup': { px: -3.2, py: 0, pz: 2.5, rx: 0, ry: 0, rz: 0, s: 1.0, visible: true },
+    'pen': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'glasses': { px: 1.5, py: 0.05, pz: 2.0, rx: 0, ry: -0.4, rz: 0, s: 1.0, visible: true },
+    'camera': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'bottle': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'avocado': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'scale': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'armchair': { px: -11.0, py: 0, pz: -9.0, rx: 0, ry: 0.8, rz: 0, s: 1.0, visible: true },
+    'lantern': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false }
+  },
+  'creative-studio': {
+    'plant': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'teacup': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'pen': { px: 2.2, py: 0.06, pz: 1.5, rx: 0, ry: 0.4, rz: 0, s: 1.0, visible: true },
+    'glasses': { px: -1.8, py: 0.05, pz: 2.8, rx: 0, ry: -0.2, rz: 0, s: 1.0, visible: true },
+    'camera': { px: -3.8, py: 0, pz: -2.0, rx: 0, ry: 0.8, rz: 0, s: 1.0, visible: true },
+    'bottle': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'avocado': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'scale': { px: 4.8, py: 0, pz: -2.8, rx: 0, ry: -0.5, rz: 0, s: 1.0, visible: true },
+    'armchair': { px: -9.0, py: 0, pz: -8.0, rx: 0, ry: 0.6, rz: 0, s: 1.0, visible: true },
+    'lantern': { px: 2.5, py: 0, pz: -3.5, rx: 0, ry: 0.2, rz: 0, s: 1.0, visible: true }
+  },
+  'modern-study': {
+    'plant': { px: 4.2, py: 0, pz: -3.0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: true },
+    'teacup': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'pen': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'glasses': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'camera': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'bottle': { px: -3.5, py: 0, pz: -2.0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: true },
+    'avocado': { px: 2.5, py: 0, pz: 2.2, rx: 0.2, ry: 0.8, rz: -0.1, s: 1.0, visible: true },
+    'scale': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'armchair': { px: -10.0, py: 0, pz: -8.5, rx: 0, ry: 0.4, rz: 0, s: 1.0, visible: true },
+    'lantern': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false }
+  },
+  'concrete-leaning-3d': {
+    'plant': { px: 4.5, py: 0, pz: -2.8, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'teacup': { px: -3.5, py: 0, pz: 2.2, rx: 0, ry: 0.5, rz: 0, s: 1.0, visible: false },
+    'pen': { px: 1.5, py: 0.06, pz: 1.8, rx: 0, ry: -0.4, rz: 0, s: 1.0, visible: false },
+    'glasses': { px: -1.0, py: 0.05, pz: 2.5, rx: 0, ry: 0.2, rz: 0, s: 1.0, visible: false },
+    'camera': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'bottle': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'avocado': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'scale': { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0, s: 1.0, visible: false },
+    'armchair': { px: -11.0, py: 0, pz: -8.0, rx: 0, ry: 0.7, rz: 0, s: 1.0, visible: false },
+    'lantern': { px: 5.5, py: 0, pz: 1.0, rx: 0, ry: -0.2, rz: 0, s: 1.0, visible: false }
+  }
+};
+
+function applyPropPresetDefaults(pre) {
+  const defaults = propPresetDefaults[pre];
+  loadedProps.forEach(p => {
+    const key = p.name.toLowerCase();
+    if (defaults && defaults[key]) {
+      const d = defaults[key];
+      p.group.position.set(d.px, d.py, d.pz);
+      p.group.rotation.set(d.rx, d.ry, d.rz);
+      p.group.scale.setScalar(d.s);
+      p.group.visible = d.visible;
+    } else {
+      p.group.visible = false;
+    }
+  });
+}
 
 // Set up floor and environment based on preset
 function applyPreset() {
@@ -1178,14 +1961,55 @@ function applyPreset() {
     floorMetal = 0.9;
     floorRough = 0.25;
   } else if (pre === 'wood-angle') {
-    // 3D Table Studio - fully modeled in 3D!
     bgColor = new THREE.Color('#efebe9'); // Warm cozy studio wall
     floorColor = '#ffffff'; // White base color under wood texture map
     floorMetal = 0.1;
     floorRough = 0.45;
     if (propsGroup) propsGroup.visible = true;
-    // leaf shadow plane is NEVER a shadow caster (it only acts as stencil in photo mode)
     if (leafShadowPlane) leafShadowPlane.visible = false;
+  } else if (pre === 'marble-desk') {
+    bgColor = new THREE.Color('#eae6e8'); // elegant warm-grey background
+    floorColor = '#ffffff';
+    floorMetal = 0.2;
+    floorRough = 0.15; // glossy marble!
+    if (propsGroup) propsGroup.visible = true;
+    if (leafShadowPlane) leafShadowPlane.visible = false;
+  } else if (pre === 'creative-studio') {
+    bgColor = new THREE.Color('#1c1a1a'); // dark moody studio wall
+    floorColor = '#424242'; // dark grey concrete/slate
+    floorMetal = 0.05;
+    floorRough = 0.6;
+    if (propsGroup) propsGroup.visible = true;
+    if (leafShadowPlane) leafShadowPlane.visible = false;
+  } else if (pre === 'modern-study') {
+    bgColor = new THREE.Color('#f5f5f3'); // crisp bright white/grey wall
+    floorColor = '#ffffff';
+    floorMetal = 0.05;
+    floorRough = 0.5;
+    if (propsGroup) propsGroup.visible = true;
+    if (leafShadowPlane) leafShadowPlane.visible = false;
+  } else if (pre === 'concrete-leaning-3d') {
+    bgColor = new THREE.Color('#948f8a'); // Warm concrete wall color
+    floorColor = '#a8a39e';
+    floorMetal = 0.05;
+    floorRough = 0.55;
+    
+    // Force sharp sunlight shadow configurations programmatically
+    state.shadowSoftness = 0.15;
+    const softInput = document.getElementById('input-shadow-softness');
+    if (softInput) softInput.value = 0.15;
+    const softVal = document.getElementById('shadow-val');
+    if (softVal) softVal.textContent = 'Sharp';
+
+    if (propsGroup) propsGroup.visible = true;
+    if (leafShadowPlane) leafShadowPlane.visible = true;
+  } else if (pre === 'hands-cotton') {
+    bgColor = new THREE.Color('#eae3d9'); // Soft neutral warm linen studio color
+    floorColor = '#f5efe6';
+    floorMetal = 0.02;
+    floorRough = 0.85;
+    if (propsGroup) propsGroup.visible = false;
+    if (leafShadowPlane) leafShadowPlane.visible = true;
   } else {
     // It's a photorealistic photo backdrop!
     isPhotoBackdrop = true;
@@ -1215,10 +2039,38 @@ function applyPreset() {
     if (isPhotoBackdrop) {
       floorPlane.material = new THREE.ShadowMaterial({ opacity: 0.55 });
     } else if (pre === 'wood-angle') {
-      // Map wood texture canvas to the 3D desk floor
       floorPlane.material = new THREE.MeshStandardMaterial({
         color: new THREE.Color(floorColor),
         map: generateWoodTexture(),
+        roughness: floorRough,
+        metalness: floorMetal
+      });
+    } else if (pre === 'marble-desk') {
+      const textureLoader = new THREE.TextureLoader();
+      const marbleTex = textureLoader.load('/backdrop_marble.png');
+      marbleTex.wrapS = THREE.RepeatWrapping;
+      marbleTex.wrapT = THREE.RepeatWrapping;
+      marbleTex.repeat.set(2, 2);
+      floorPlane.material = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(floorColor),
+        map: marbleTex,
+        roughness: floorRough,
+        metalness: floorMetal
+      });
+    } else if (pre === 'creative-studio' || pre === 'concrete-leaning-3d') {
+      const tex = concretePhotoTexture || generateConcreteTexture(floorColor, floorRough);
+      floorPlane.material = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(pre === 'concrete-leaning-3d' ? '#eae2d8' : '#ffffff'), // tint concrete texture to warm sandstone!
+        map: tex,
+        bumpMap: tex, // 3D micro-grain bump reflections
+        bumpScale: pre === 'concrete-leaning-3d' ? 0.12 : 0.03, // highly intense bump depth!
+        roughness: pre === 'concrete-leaning-3d' ? 0.95 : floorRough, // unpolished matte texture
+        metalness: 0.0
+      });
+    } else if (pre === 'modern-study') {
+      floorPlane.material = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(floorColor),
+        map: generateLightWoodTexture(),
         roughness: floorRough,
         metalness: floorMetal
       });
@@ -1233,6 +2085,47 @@ function applyPreset() {
     floorPlane.castShadow = false; // floor never casts — only receives
   }
 
+  // Update Back Wall Material, Rotation, and Position
+  if (backWallPlane) {
+    if (isPhotoBackdrop) {
+      backWallPlane.visible = false;
+    } else {
+      backWallPlane.visible = true;
+      backWallPlane.material.dispose();
+      
+      // Position and rotate wall diagonally for concrete-leaning-3d to match photo perspective
+      if (pre === 'concrete-leaning-3d') {
+        backWallPlane.rotation.y = -Math.PI / 6.5; // diagonal rotation (approx -28 degrees)
+        backWallPlane.position.set(-6.0, 75.0, -9.0); // shift left and forward to meet the ground line
+      } else {
+        backWallPlane.rotation.y = 0; // standard flat wall facing camera
+        backWallPlane.position.set(0, 75.0, -18.0); // push back to origin wall boundary
+      }
+
+      if (pre === 'creative-studio' || pre === 'concrete-leaning-3d') {
+        const wallColor = pre === 'creative-studio' ? '#424242' : '#9e9994';
+        const wallRough = pre === 'creative-studio' ? 0.8 : 0.7;
+        const tex = concretePhotoTexture || generateConcreteTexture(wallColor, wallRough);
+        backWallPlane.material = new THREE.MeshStandardMaterial({
+          color: new THREE.Color(pre === 'concrete-leaning-3d' ? '#eae2d8' : '#ffffff'), // tint concrete texture to warm sandstone!
+          map: tex,
+          bumpMap: tex, // 3D wall plaster bump relief
+          bumpScale: pre === 'concrete-leaning-3d' ? 0.15 : 0.04, // very deep bump scale!
+          roughness: pre === 'concrete-leaning-3d' ? 0.95 : wallRough, // unpolished vertical wall
+          metalness: 0.0
+        });
+      } else {
+        backWallPlane.material = new THREE.MeshStandardMaterial({
+          color: bgColor.clone(),
+          roughness: 0.9,
+          metalness: 0.0
+        });
+      }
+      backWallPlane.receiveShadow = true;
+      backWallPlane.castShadow = false;
+    }
+  }
+
   // Handle vertical wall shadow catcher visibility (leaning wall scene)
   if (wallShadowPlane) {
     if (pre === 'concrete-wall') {
@@ -1245,6 +2138,9 @@ function applyPreset() {
 
   // Align composition and camera angles for each preset to fit the background image perfectly
   alignPresetCamera();
+
+  // Apply default prop visibility/transform based on preset
+  applyPropPresetDefaults(pre);
 
   // Apply real-time hands chroma-key extraction overlay
   applyForegroundOverlay();
@@ -1290,15 +2186,29 @@ function applyForegroundOverlay() {
       const r = data[i];
       const g = data[i + 1];
       const b = data[i + 2];
-
-      // Skin detection filter (warm peach/orange hand pixels)
-      const isSkin = r > 60 && g > 40 && b > 20 && r > g && (r - g) > 12;
       
-      // Clothing detection (neutral dark grey sleeves)
-      const isClothing = r < 120 && g < 120 && b < 120 && Math.abs(r - g) < 20 && Math.abs(g - b) < 20;
-
-      if (!isSkin && !isClothing) {
-        data[i + 3] = 0; // Make other pixels (sky, blue backdrop, teal book) transparent
+      let makeTransparent = false;
+      
+      if (pre === 'hands-blue') {
+        // Key out background cyan/blue:
+        const isCyan = (b > 120 && b > r * 1.3) || (g > 140 && g > r * 1.2);
+        // Key out the old teal book cover in the photo:
+        const isTealBook = (r < 110 && g > 75 && b > 75) || (r < 120 && g > 110 && b > 120);
+        if (isCyan || isTealBook) {
+          makeTransparent = true;
+        }
+      } else if (pre === 'hands-sky') {
+        // Key out sky blue and white clouds:
+        const isSkyBlue = (b > 120 && b > r * 1.05) || (r > 180 && g > 180 && b > 180);
+        // Key out the old orange/yellow book cover in the photo:
+        const isOrangeBook = (r > 130 && g > 90 && b < 120 && r > b * 1.2);
+        if (isSkyBlue || isOrangeBook) {
+          makeTransparent = true;
+        }
+      }
+      
+      if (makeTransparent) {
+        data[i + 3] = 0; // Set pixel to transparent
       }
     }
 
@@ -1315,114 +2225,144 @@ function applyForegroundOverlay() {
 function updateLights() {
   if (!scene) return;
 
-  // Dispose existing lights
+  // Dispose existing lights and targets from the scene graph
   Object.keys(lights).forEach(k => scene.remove(lights[k]));
   lights = {};
 
   const pre = state.preset;
   const rad = (state.lightRotation * Math.PI) / 180;
   const intensity = state.lightIntensity;
-  const distance = 8.0;
+  
+  // Set light distance to 35.0 inches to ensure it remains well outside the scene bounding box
+  const distance = 35.0;
   const lx = Math.cos(rad) * distance;
   const lz = Math.sin(rad) * distance;
 
-  // Scene centre target — all key lights point here so shadow frustum is centred on objects
-  const sceneTarget = new THREE.Object3D();
-  sceneTarget.position.set(0, 1.0, 0);
-  scene.add(sceneTarget);
+  const targetY = (state.height * INCH_TO_THREE) / 2;
 
-  function makeDir(color, mul, px, py, pz) {
+  function makeDir(color, mul, px, py, pz, castShadow = false, range = 15.0) {
     const d = new THREE.DirectionalLight(color, mul * intensity);
     d.position.set(px, py, pz);
-    d.target = sceneTarget;
+    d.target.position.set(0, targetY, 0);
+    
+    // Add both light and its target to registry to allow clean cleanup on rebuild
+    const keyId = 'dirLight_' + Math.random().toString(36).substr(2, 9);
+    const targetId = 'dirTarget_' + Math.random().toString(36).substr(2, 9);
+    lights[keyId] = d;
+    lights[targetId] = d.target;
+
+    if (castShadow) {
+      d.castShadow = true;
+      d.shadow.mapSize.width = 4096; // 4K shadow mapping for fine-detail soft rendering
+      d.shadow.mapSize.height = 4096;
+      d.shadow.camera.near = 1.0;
+      d.shadow.camera.far = 100.0;
+      
+      d.shadow.camera.left = -range;
+      d.shadow.camera.right = range;
+      d.shadow.camera.top = range;
+      d.shadow.camera.bottom = -range;
+      
+      // normalBias prevents self-shadow acne on thin sheets / hard covers
+      d.shadow.bias = -0.0004;
+      d.shadow.normalBias = 0.05;
+      d.shadow.radius = Math.max(1.0, state.shadowSoftness * 5.0);
+    }
     return d;
   }
 
-  if (pre === 'studio' || pre === 'hands-blue') {
-    lights.ambient = new THREE.AmbientLight(0xffffff, 0.6 * intensity);
-    const key = makeDir(0xffffff, 1.35, lx, 8.0, lz);
-    configureShadows(key, 7);
-    lights.key = key;
-    lights.fill = makeDir(0xe2e8f0, 0.4, -lx, 3.0, -lz);
-    const rim = new THREE.SpotLight(0xffffff, 0.7 * intensity, 15, Math.PI / 6, 0.5, 1);
-    rim.position.set(0, 5, -6);
+  if (pre === 'studio' || pre === 'hands-blue' || pre === 'hands-cotton') {
+    lights.ambient = new THREE.AmbientLight(0xffffff, 0.55 * intensity);
+    makeDir(0xffffff, 1.4, lx, 25.0, lz, true, 12.0);
+    makeDir(0xe2e8f0, 0.45, -lx, 15.0, -lz, false);
+    
+    const rim = new THREE.SpotLight(0xffffff, 0.8 * intensity, 40, Math.PI / 6, 0.5, 1);
+    rim.position.set(0, 22, -22);
+    rim.target.position.set(0, targetY, 0);
     lights.rim = rim;
+    lights.rimTarget = rim.target;
 
   } else if (pre === 'clean-flatlay') {
-    lights.ambient = new THREE.AmbientLight(0xfffaf0, 0.75 * intensity);
-    const key = makeDir(0xfffdf9, 1.1, 2.0, 8.0, 3.0);
-    configureShadows(key, 8);
-    lights.key = key;
-    lights.fill = makeDir(0xffffff, 0.3, -2.0, 3.0, -3.0);
+    lights.ambient = new THREE.AmbientLight(0xfffaf0, 0.7 * intensity);
+    makeDir(0xfffdf9, 1.25, lx, 28.0, lz, true, 12.0);
+    makeDir(0xffffff, 0.35, -lx, 15.0, -lz, false);
 
   } else if (pre === 'concrete-wall') {
-    lights.ambient = new THREE.AmbientLight(0xfff7e6, 0.3 * intensity);
-    const key = makeDir(0xffeedd, 2.2, lx, 4.0, lz);
-    configureShadows(key, 9);
-    key.shadow.radius = state.shadowSoftness * 1.5;
-    lights.key = key;
-    lights.fill = makeDir(0xe0e7ff, 0.4, -lx, 2.0, -lz);
+    lights.ambient = new THREE.AmbientLight(0xfff7e6, 0.45 * intensity);
+    makeDir(0xffeedd, 2.3, lx, 20.0, lz, true, 15.0);
+    makeDir(0xe0e7ff, 0.55, -lx, 12.0, -lz, false);
+
+  } else if (pre === 'concrete-leaning-3d') {
+    lights.ambient = new THREE.AmbientLight(0xd9e6ff, 0.55 * intensity); // Cool blue sky dome ambient fill
+    makeDir(0xfff5ea, 3.2, lx, 24.0, lz, true, 18.0); // Blazing hot direct sunlight
+    makeDir(0xd0e0ff, 0.6, -lx, 15.0, -lz, false); // Cool sky shadow fill bounce
 
   } else if (pre === 'hands-sky') {
     lights.ambient = new THREE.AmbientLight(0xdbeafe, 0.65 * intensity);
-    const key = makeDir(0xffffff, 1.9, 2.0, 9.0, 1.0);
-    configureShadows(key, 7);
-    lights.key = key;
-    lights.fill = makeDir(0xbfdbfe, 0.5, -2.0, 3.0, -2.0);
+    makeDir(0xffffff, 1.8, lx, 28.0, lz, true, 12.0);
+    makeDir(0xbfdbfe, 0.5, -lx, 15.0, -lz, false);
 
   } else if (pre === 'midnight-mood') {
     lights.ambient = new THREE.AmbientLight(0x181829, 0.25 * intensity);
-    const key = makeDir(0xd8b4fe, 0.75, lx, 6.0, lz);
-    configureShadows(key, 7);
-    lights.key = key;
-    lights.blueRim    = makeDir(0x06b6d4, 1.9, -5, 4, -4);
-    lights.magentaRim = makeDir(0xec4899, 1.6,  5, 3, -4);
+    makeDir(0xd8b4fe, 0.85, lx, 22.0, lz, true, 12.0);
+    makeDir(0x06b6d4, 2.0, -15, 12, -15, false);
+    makeDir(0xec4899, 1.7, 15, 10, -15, false);
 
   } else if (pre === 'wood-angle') {
-    lights.ambient = new THREE.AmbientLight(0xffecd9, 0.45 * intensity);
-    const key = makeDir(0xfff1e2, 1.45, lx, 7.0, lz);
-    configureShadows(key, 10); // wider for full 3D table scene
-    lights.key = key;
+    lights.ambient = new THREE.AmbientLight(0xffecd9, 0.5 * intensity);
+    makeDir(0xfff1e2, 1.5, lx, 24.0, lz, true, 18.0);
 
-    // Warm desk spotlight above centre — properly configured with shadow
-    const spot = new THREE.SpotLight(0xffdcb3, 1.8 * intensity, 14, Math.PI / 4.5, 0.35, 0.8);
-    spot.position.set(1, 6, 2);
-    spot.target = sceneTarget;
+    const spot = new THREE.SpotLight(0xffdcb3, 2.0 * intensity, 40, Math.PI / 4, 0.35, 0.8);
+    spot.position.set(2, 22, 5);
+    spot.target.position.set(0, 0, 0);
     spot.castShadow = true;
     spot.shadow.mapSize.set(2048, 2048);
-    spot.shadow.camera.near = 0.5;
-    spot.shadow.camera.far = 20;
+    spot.shadow.camera.near = 1.0;
+    spot.shadow.camera.far = 40.0;
     spot.shadow.bias = -0.0004;
     spot.shadow.normalBias = 0.05;
     spot.shadow.radius = Math.max(1.5, state.shadowSoftness * 5.0);
+    
     lights.spot = spot;
+    lights.spotTarget = spot.target;
+
+  } else if (pre === 'marble-desk') {
+    lights.ambient = new THREE.AmbientLight(0xfff0f5, 0.6 * intensity);
+    makeDir(0xfff5fa, 1.4, lx, 24.0, lz, true, 18.0);
+    makeDir(0xe6e6fa, 0.5, -lx, 15.0, -lz, false);
+
+  } else if (pre === 'creative-studio') {
+    lights.ambient = new THREE.AmbientLight(0x222020, 0.35 * intensity);
+    makeDir(0xffdcb3, 1.9, lx, 26.0, lz, true, 18.0);
+    makeDir(0x708090, 0.4, -lx, 15.0, -lz, false);
+
+  } else if (pre === 'modern-study') {
+    lights.ambient = new THREE.AmbientLight(0xf0f4f8, 0.7 * intensity);
+    makeDir(0xffffff, 1.6, lx, 28.0, lz, true, 18.0);
+    makeDir(0xe6f2ff, 0.5, -lx, 15.0, -lz, false);
   }
 
-  Object.keys(lights).forEach(k => scene.add(lights[k]));
-}
+  // Configure leaf shadow plane position for 3D sunlight stencils
+  if (leafShadowPlane) {
+    if (pre === 'concrete-leaning-3d') {
+      leafShadowPlane.visible = true;
+      leafShadowPlane.castShadow = true;
+      
+      const targetPos = new THREE.Vector3(0, targetY, 0);
+      const lightPos = new THREE.Vector3(lx, 24.0, lz);
+      
+      const planePos = new THREE.Vector3().lerpVectors(targetPos, lightPos, 0.45);
+      leafShadowPlane.position.copy(planePos);
+      leafShadowPlane.lookAt(lightPos);
+      leafShadowPlane.scale.set(7.5, 7.5, 1.0);
+    } else {
+      leafShadowPlane.visible = false;
+      leafShadowPlane.castShadow = false;
+    }
+  }
 
-// Shadow configuration — proper physics-based PCF shadow maps
-// range: half-size of the orthographic frustum (smaller = sharper, must cover scene)
-function configureShadows(light, range = 8.0) {
-  light.castShadow = true;
-  // 4K shadow maps for crisp detail
-  light.shadow.mapSize.width  = 4096;
-  light.shadow.mapSize.height = 4096;
-  light.shadow.camera.near = 0.5;
-  light.shadow.camera.far  = 35;
-  
-  // Orthographic frustum centred on scene (target is always set to scene centre)
-  light.shadow.camera.left   = -range;
-  light.shadow.camera.right  =  range;
-  light.shadow.camera.top    =  range;
-  light.shadow.camera.bottom = -range;
-  
-  // normalBias eliminates self-shadowing (acne) on thin surfaces like book covers/hinges
-  // bias pulls shadow slightly towards caster to avoid detachment (peter-panning)
-  light.shadow.bias       = -0.0002;
-  light.shadow.normalBias =  0.04;    // higher value = no acne on flat/thin surfaces
-  // PCFSoft radius for penumbra softness
-  light.shadow.radius = Math.max(1.0, state.shadowSoftness * 5.0);
+  // Add all active lights and targets to the scene graph
+  Object.keys(lights).forEach(k => scene.add(lights[k]));
 }
 
 // --- INITIALIZATION ---
@@ -1475,6 +2415,8 @@ function init() {
   linenBumpTexture = generateLinenBumpTexture();
   paperBumpTexture = generatePaperBumpTexture();
   state.matteTex = generateMatteCoatTexture(); // paperback matte coating micro-fiber
+  loadConcretePhotoTexture(); // Async load and crop clean concrete textures from photo backdrop
+  loadHandModels();           // Async load left and right 3D hand models
 
   // 6. Floor Plane
   const floorGeom = new THREE.PlaneGeometry(100, 100);
@@ -1483,6 +2425,14 @@ function init() {
   floorPlane.position.y = 0;
   floorPlane.receiveShadow = true;
   scene.add(floorPlane);
+
+  // 6a. Back Wall Plane (large wall to cover side angles completely)
+  const backWallGeom = new THREE.PlaneGeometry(300, 150);
+  backWallPlane = new THREE.Mesh(backWallGeom, new THREE.MeshStandardMaterial({ roughness: 0.95, metalness: 0.0 }));
+  backWallPlane.position.set(0, 75.0, -18.0); // Z = -18, centered, Y = 75
+  backWallPlane.receiveShadow = true;
+  backWallPlane.castShadow = false;
+  scene.add(backWallPlane);
 
   // 6b. Wall Shadow Catcher (vertical plane behind the book pivot to receive sandstone wall shadows)
   const wallGeom = new THREE.PlaneGeometry(100, 100);
@@ -1496,6 +2446,10 @@ function init() {
   propsGroup = new THREE.Group();
   scene.add(propsGroup);
   create3DProps();
+
+  // 6d. 3D Hands Group
+  handsGroup = new THREE.Group();
+  scene.add(handsGroup);
 
   // 7. Studio Ground Grid — a reference plane grid (like Blender's)
   //    Each cell = 1 Three.js unit = 1 inch. Helps see proportions and align objects.
@@ -1515,12 +2469,13 @@ function init() {
   const leafMat = new THREE.MeshBasicMaterial({
     alphaMap: leafTex,
     transparent: true,
-    opacity: 0,
+    alphaTest: 0.5,
+    colorWrite: false, // make it invisible to color pass
     side: THREE.DoubleSide
   });
   const leafGeom = new THREE.PlaneGeometry(3, 3);
   leafShadowPlane = new THREE.Mesh(leafGeom, leafMat);
-  leafShadowPlane.castShadow = false; // NEVER cast — causes stripe artifacts on floor
+  leafShadowPlane.castShadow = true; // allow casting gobo shadow cookies!
   leafShadowPlane.visible = false;
   scene.add(leafShadowPlane);
 
@@ -1623,6 +2578,33 @@ document.addEventListener('DOMContentLoaded', () => {
     // Grid button active state
     const tgBtn = document.getElementById('toggle-grid-btn');
     if (tgBtn) tgBtn.classList.toggle('active', !!state.showGrid);
+
+    // Book alignment nudges UI sync
+    const nudgeX = document.getElementById('input-book-nudge-x');
+    if (nudgeX) {
+      nudgeX.value = state.bookNudgeX;
+      document.getElementById('book-nudge-x-val').textContent = state.bookNudgeX.toFixed(2) + '"';
+    }
+    const nudgeY = document.getElementById('input-book-nudge-y');
+    if (nudgeY) {
+      nudgeY.value = state.bookNudgeY;
+      document.getElementById('book-nudge-y-val').textContent = state.bookNudgeY.toFixed(2) + '"';
+    }
+    const nudgeZ = document.getElementById('input-book-nudge-z');
+    if (nudgeZ) {
+      nudgeZ.value = state.bookNudgeZ;
+      document.getElementById('book-nudge-z-val').textContent = state.bookNudgeZ.toFixed(2) + '"';
+    }
+    const nudgeRy = document.getElementById('input-book-nudge-ry');
+    if (nudgeRy) {
+      nudgeRy.value = state.bookNudgeRy;
+      document.getElementById('book-nudge-ry-val').textContent = state.bookNudgeRy + '°';
+    }
+    const nudgeScale = document.getElementById('input-book-nudge-scale');
+    if (nudgeScale) {
+      nudgeScale.value = state.bookNudgeScale;
+      document.getElementById('book-nudge-scale-val').textContent = state.bookNudgeScale.toFixed(2) + 'x';
+    }
   })();
   // ============================================================
 
@@ -1633,7 +2615,9 @@ document.addEventListener('DOMContentLoaded', () => {
   // Registry of all scene objects — populated here and refreshed
   // when new props are loaded by create3DProps()
   const ICONS = {
-    Book: '📖', Plant: '🌿', Teacup: '☕', Pen: '🖊️',
+    Book: '📖', Plant: '🌿', Teacup: '☕', Glasses: '👓',
+    Camera: '📷', Bottle: '🍼', Avocado: '🥑', Scale: '⚖️',
+    Armchair: '🪑', Lantern: '🏮', Pen: '🖊️',
     Floor: '⬜', Wall: '🧱'
   };
 
@@ -1644,31 +2628,61 @@ document.addEventListener('DOMContentLoaded', () => {
   // Build the registry from current scene objects
   function buildRegistry() {
     const reg = [];
+    
+    function ensureDefaults(g) {
+      if (!g.userData.defaultPos) g.userData.defaultPos = g.position.clone();
+      if (!g.userData.defaultRot) g.userData.defaultRot = g.rotation.clone();
+      if (!g.userData.defaultScale) g.userData.defaultScale = g.scale.clone();
+    }
+
     if (bookGroup) {
+      ensureDefaults(bookGroup);
       reg.push({
         id: 'book', name: 'Book', group: bookGroup,
-        locked: false, visible: true,
-        defaultPos: bookGroup.position.clone(),
-        defaultRot: bookGroup.rotation.clone(),
-        defaultScale: bookGroup.scale.clone()
+        locked: !!bookGroup.userData.locked,
+        visible: bookGroup.visible,
+        defaultPos: bookGroup.userData.defaultPos,
+        defaultRot: bookGroup.userData.defaultRot,
+        defaultScale: bookGroup.userData.defaultScale
       });
     }
     loadedProps.forEach(p => {
+      ensureDefaults(p.group);
       reg.push({
         id: p.name.toLowerCase(), name: p.name, group: p.group,
-        locked: false, visible: p.group.visible,
-        defaultPos: p.group.position.clone(),
-        defaultRot: p.group.rotation.clone(),
-        defaultScale: p.group.scale.clone()
+        locked: !!p.group.userData.locked,
+        visible: p.group.visible,
+        defaultPos: p.group.userData.defaultPos,
+        defaultRot: p.group.userData.defaultRot,
+        defaultScale: p.group.userData.defaultScale
       });
     });
+    if (backWallPlane) {
+      ensureDefaults(backWallPlane);
+      if (backWallPlane.userData.locked === undefined) {
+        backWallPlane.userData.locked = true;
+      }
+      reg.push({
+        id: 'wall', name: 'Wall', group: backWallPlane,
+        locked: !!backWallPlane.userData.locked,
+        visible: backWallPlane.visible,
+        defaultPos: backWallPlane.userData.defaultPos,
+        defaultRot: backWallPlane.userData.defaultRot,
+        defaultScale: backWallPlane.userData.defaultScale
+      });
+    }
     if (floorPlane) {
+      ensureDefaults(floorPlane);
+      if (floorPlane.userData.locked === undefined) {
+        floorPlane.userData.locked = true; // Floor is locked by default
+      }
       reg.push({
         id: 'floor', name: 'Floor', group: floorPlane,
-        locked: true, visible: true,
-        defaultPos: floorPlane.position.clone(),
-        defaultRot: floorPlane.rotation.clone(),
-        defaultScale: floorPlane.scale.clone()
+        locked: !!floorPlane.userData.locked,
+        visible: floorPlane.visible,
+        defaultPos: floorPlane.userData.defaultPos,
+        defaultRot: floorPlane.userData.defaultRot,
+        defaultScale: floorPlane.userData.defaultScale
       });
     }
     return reg;
@@ -1705,13 +2719,13 @@ document.addEventListener('DOMContentLoaded', () => {
       actions.className = 'outliner-actions';
 
       const visBtn = document.createElement('button');
-      visBtn.className = 'outliner-btn' + (entry.visible ? '' : '');
+      visBtn.className = 'outliner-btn';
       visBtn.title = entry.visible ? 'Hide' : 'Show';
       visBtn.textContent = entry.visible ? '👁' : '🚫';
       visBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        entry.visible = !entry.visible;
-        entry.group.visible = entry.visible;
+        entry.group.visible = !entry.group.visible;
+        saveSettings();
         renderOutliner();
       });
 
@@ -1721,7 +2735,8 @@ document.addEventListener('DOMContentLoaded', () => {
       lockBtn.textContent = entry.locked ? '🔒' : '🔓';
       lockBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        entry.locked = !entry.locked;
+        entry.group.userData.locked = !entry.group.userData.locked;
+        saveSettings();
         renderOutliner();
       });
 
@@ -1778,6 +2793,15 @@ document.addEventListener('DOMContentLoaded', () => {
   function syncInspectorFromObject(entry) {
     if (!entry) return;
     const g = entry.group;
+    const isLocked = !!g.userData.locked;
+    const inputs = ['inp-px', 'inp-py', 'inp-pz', 'inp-rx', 'inp-ry', 'inp-rz', 'inp-s'];
+    inputs.forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.disabled = isLocked;
+    });
+    const resetBtn = document.getElementById('inspector-reset-btn');
+    if (resetBtn) resetBtn.disabled = isLocked;
+
     const px = document.getElementById('inp-px');
     const py = document.getElementById('inp-py');
     const pz = document.getElementById('inp-pz');
@@ -1870,7 +2894,11 @@ document.addEventListener('DOMContentLoaded', () => {
   window.__selectSceneObj = (name) => {
     sceneRegistry = buildRegistry();
     const found = sceneRegistry.find(e => e.name === name);
-    if (found) selectEntry(found);
+    if (found) {
+      selectEntry(found);
+    } else {
+      selectEntry(null);
+    }
   };
 
   // Patch the drag findTopGroup callback to auto-select in outliner too
@@ -1890,6 +2918,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const removeCoverBtn = document.getElementById('remove-cover-btn');
   const loadDemoBtn = document.getElementById('load-demo-btn');
   const exportBtn = document.getElementById('export-png-btn');
+  const perfectRenderBtn = document.getElementById('perfect-render-btn');
   
   const bookTypeRadios = document.querySelectorAll('input[name="book-type"]');
   const inputWidth = document.getElementById('input-width');
@@ -1923,6 +2952,10 @@ document.addEventListener('DOMContentLoaded', () => {
   const selectExportScale = document.getElementById('select-export-scale');
   
   const spinner = document.getElementById('spinner');
+
+  const exportConfigBtn = document.getElementById('export-config-btn');
+  const importConfigBtn = document.getElementById('import-config-btn');
+  const importConfigFile = document.getElementById('import-config-file');
 
   // Load a file wrapper into state and trigger rebuilds
   function loadCoverImage(src) {
@@ -2164,34 +3197,213 @@ document.addEventListener('DOMContentLoaded', () => {
     saveSettings();
   });
 
+  // Book alignment nudge event listeners
+  const inputNudgeX = document.getElementById('input-book-nudge-x');
+  const inputNudgeY = document.getElementById('input-book-nudge-y');
+  const inputNudgeZ = document.getElementById('input-book-nudge-z');
+  const inputNudgeRy = document.getElementById('input-book-nudge-ry');
+  const inputNudgeScale = document.getElementById('input-book-nudge-scale');
+
+  const nudgeXVal = document.getElementById('book-nudge-x-val');
+  const nudgeYVal = document.getElementById('book-nudge-y-val');
+  const nudgeZVal = document.getElementById('book-nudge-z-val');
+  const nudgeRyVal = document.getElementById('book-nudge-ry-val');
+  const nudgeScaleVal = document.getElementById('book-nudge-scale-val');
+
+  if (inputNudgeX) {
+    inputNudgeX.addEventListener('input', (e) => {
+      state.bookNudgeX = parseFloat(e.target.value);
+      nudgeXVal.innerText = `${state.bookNudgeX.toFixed(2)}"`;
+      alignPresetCamera();
+      saveSettings();
+    });
+  }
+  if (inputNudgeY) {
+    inputNudgeY.addEventListener('input', (e) => {
+      state.bookNudgeY = parseFloat(e.target.value);
+      nudgeYVal.innerText = `${state.bookNudgeY.toFixed(2)}"`;
+      alignPresetCamera();
+      saveSettings();
+    });
+  }
+  if (inputNudgeZ) {
+    inputNudgeZ.addEventListener('input', (e) => {
+      state.bookNudgeZ = parseFloat(e.target.value);
+      nudgeZVal.innerText = `${state.bookNudgeZ.toFixed(2)}"`;
+      alignPresetCamera();
+      saveSettings();
+    });
+  }
+  if (inputNudgeRy) {
+    inputNudgeRy.addEventListener('input', (e) => {
+      state.bookNudgeRy = parseInt(e.target.value);
+      nudgeRyVal.innerText = `${state.bookNudgeRy}°`;
+      alignPresetCamera();
+      saveSettings();
+    });
+  }
+  if (inputNudgeScale) {
+    inputNudgeScale.addEventListener('input', (e) => {
+      state.bookNudgeScale = parseFloat(e.target.value);
+      nudgeScaleVal.innerText = `${state.bookNudgeScale.toFixed(2)}x`;
+      alignPresetCamera();
+      saveSettings();
+    });
+  }
+
+  function applyCameraShot(shotName) {
+    if (!camera || !controls) return;
+    
+    const w = state.width * INCH_TO_THREE;
+    const h = state.height * INCH_TO_THREE;
+    const d = state.spineWidth * INCH_TO_THREE;
+    const maxDim = Math.max(w, h);
+    
+    const isLying = state.composition === 'lying' || state.preset === 'clean-flatlay' || state.preset === 'wood-angle' || state.preset === 'marble-desk';
+    
+    if (isLying) {
+      // Book is lying flat on the floor (rotated -Math.PI / 2 on X)
+      if (shotName === 'front') {
+        // Front cover is facing UP
+        camera.position.set(0, maxDim * 1.4, 0.01);
+        controls.target.set(0, 0, 0);
+      } else if (shotName === 'spine') {
+        // Spine is facing LEFT (negative X)
+        camera.position.set(-maxDim * 1.2, maxDim * 0.3, 0);
+        controls.target.set(0, 0, 0);
+      } else if (shotName === 'back') {
+        // Back cover is facing down, show nice low 3/4 angle from the back
+        camera.position.set(0, maxDim * 0.4, -maxDim * 1.2);
+        controls.target.set(0, 0, 0);
+      } else if (shotName === 'top') {
+        // Top edge is facing BACK (negative Z)
+        camera.position.set(0, maxDim * 0.3, -maxDim * 1.2);
+        controls.target.set(0, 0, 0);
+      } else { // 'three-quarter'
+        camera.position.set(-w * 0.5, maxDim * 0.8, maxDim * 1.0);
+        controls.target.set(0, 0, 0);
+      }
+    } else {
+      // Book is standing vertically
+      if (shotName === 'front') {
+        camera.position.set(0, h / 2, maxDim * 1.3);
+        controls.target.set(0, h / 2, 0);
+      } else if (shotName === 'spine') {
+        camera.position.set(-maxDim * 1.2, h / 2, 0);
+        controls.target.set(0, h / 2, 0);
+      } else if (shotName === 'back') {
+        camera.position.set(0, h / 2, -maxDim * 1.3);
+        controls.target.set(0, h / 2, 0);
+      } else if (shotName === 'top') {
+        camera.position.set(0, h + maxDim * 0.8, 0.01);
+        controls.target.set(0, h / 2, 0);
+      } else { // 'three-quarter'
+        camera.position.set(maxDim * 0.8, h * 0.6, maxDim * 1.1);
+        controls.target.set(0, h * 0.4, 0);
+      }
+    }
+    controls.update();
+  }
+
+  function triggerCapture(isPerfectFrame = false) {
+    spinner.classList.remove('hidden');
+    showToast(isPerfectFrame ? '⭐ Rendering perfect-framed master snapshot...' : '📸 Rendering studio-quality snapshot...');
+  
+    // Save original camera transforms
+    const originalPos = camera.position.clone();
+    const originalTarget = controls.target.clone();
+
+    // Small delay to let spinner display
+    setTimeout(() => {
+      try {
+        const pre = state.preset;
+        if (isPerfectFrame) {
+          frameCameraOnBook(pre);
+        }
+
+        const scale = state.exportScale;
+        const container = document.getElementById('canvas-container');
+        const clientW = container.clientWidth;
+        const clientH = container.clientHeight;
+        
+        // Target high-res dims (independent of screen devicePixelRatio)
+        const targetW = clientW * scale;
+        const targetH = clientH * scale;
+  
+        // Hide helpers temporarily
+        const originalGridVisible = gridHelper.visible;
+        gridHelper.visible = false;
+        if (window._axesHelper) window._axesHelper.visible = false;
+        if (selectionBox) selectionBox.visible = false;
+  
+        // Manage transparency
+        let originalBg = scene.background;
+        if (state.exportBg === 'transparent') {
+          scene.background = null;
+          renderer.setClearColor(0x000000, 0);
+        }
+  
+        // Capture original pixel ratio to prevent duplicate multiplication
+        const originalPixelRatio = renderer.getPixelRatio();
+        renderer.setPixelRatio(1.0);
+        renderer.setSize(targetW, targetH, false);
+        camera.aspect = targetW / targetH;
+        camera.updateProjectionMatrix();
+  
+        // Render high-res frames
+        renderer.render(scene, camera);
+  
+        // Composite and download the final high-res snapshot
+        compositeAndDownload(renderer.domElement, targetW, targetH, () => {
+          // Restore renderer settings
+          renderer.setPixelRatio(originalPixelRatio);
+          renderer.setSize(clientW, clientH, true);
+          camera.aspect = clientW / clientH;
+          camera.updateProjectionMatrix();
+          
+          gridHelper.visible = originalGridVisible;
+          if (window._axesHelper) window._axesHelper.visible = state.showGrid;
+          if (selectionBox) selectionBox.visible = true;
+          
+          if (state.exportBg === 'transparent') {
+            scene.background = originalBg;
+          }
+
+          // Restore original camera angles
+          camera.position.copy(originalPos);
+          controls.target.copy(originalTarget);
+          controls.update();
+          
+          // Re-render display viewport
+          renderer.render(scene, camera);
+        });
+  
+      } catch (err) {
+        console.error(err);
+        showToast('❌ Failed to capture render.');
+        spinner.classList.add('hidden');
+
+        // Restore camera and renderer in case of crash
+        if (renderer) {
+          renderer.setPixelRatio(window.devicePixelRatio || 1.0);
+          const container = document.getElementById('canvas-container');
+          if (container) {
+            renderer.setSize(container.clientWidth, container.clientHeight, true);
+          }
+        }
+        camera.position.copy(originalPos);
+        controls.target.copy(originalTarget);
+        controls.update();
+      }
+    }, 100);
+  }
+
   // Camera presets
   camButtons.forEach(btn => {
     btn.addEventListener('click', (e) => {
       camButtons.forEach(b => b.classList.remove('active'));
       e.target.classList.add('active');
-      
-      const pos = e.target.getAttribute('data-cam');
-      
-      // Calculate distances based on book size
-      const maxDim = Math.max(state.width, state.height);
-
-      if (pos === 'front') {
-        camera.position.set(0, state.height / 2, maxDim * 1.3);
-        controls.target.set(0, state.height / 2, 0);
-      } else if (pos === 'spine') {
-        camera.position.set(-maxDim * 1.2, state.height / 2, 0);
-        controls.target.set(0, state.height / 2, 0);
-      } else if (pos === 'back') {
-        camera.position.set(0, state.height / 2, -maxDim * 1.3);
-        controls.target.set(0, state.height / 2, 0);
-      } else if (pos === 'top') {
-        camera.position.set(0, maxDim * 1.5, 0.01);
-        controls.target.set(0, 0, 0);
-      } else { // 3/4 Isometric view
-        camera.position.set(state.width * 0.8, state.height * 0.6, state.width * 1.0);
-        controls.target.set(0, state.height / 3, 0);
-      }
-      controls.update();
+      applyCameraShot(e.target.getAttribute('data-cam'));
     });
   });
 
@@ -2220,62 +3432,71 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Image capturing and download export handler
   exportBtn.addEventListener('click', () => {
-    spinner.classList.remove('hidden');
-    showToast('📸 Rendering studio-quality snapshot...');
-  
-    // Small delay to let spinner display
-    setTimeout(() => {
-      try {
-        const scale = state.exportScale;
-        const currentW = renderer.domElement.width;
-        const currentH = renderer.domElement.height;
-        
-        // Target high-res dims
-        const targetW = currentW * scale;
-        const targetH = currentH * scale;
-  
-        // Hide helpers temporarily
-        const originalGridVisible = gridHelper.visible;
-        gridHelper.visible = false;
-  
-        // Manage transparency
-        let originalBg = scene.background;
-        if (state.exportBg === 'transparent') {
-          scene.background = null;
-          renderer.setClearColor(0x000000, 0);
-        }
-  
-        // Trigger renderer resize to high-res
-        renderer.setSize(targetW, targetH, false);
-        camera.aspect = targetW / targetH;
-        camera.updateProjectionMatrix();
-  
-        // Render high-res frames
-        renderer.render(scene, camera);
-  
-        // Composite and download the final high-res snapshot
-        compositeAndDownload(renderer.domElement, targetW, targetH, () => {
-          // Restore renderer settings
-          renderer.setSize(currentW, currentH, false);
-          camera.aspect = currentW / currentH;
-          camera.updateProjectionMatrix();
-          gridHelper.visible = originalGridVisible;
-          
-          if (state.exportBg === 'transparent') {
-            scene.background = originalBg;
-          }
-          
-          // Re-render display viewport
-          renderer.render(scene, camera);
-        });
-  
-      } catch (err) {
-        console.error(err);
-        showToast('❌ Failed to capture render.');
-        spinner.classList.add('hidden');
-      }
-    }, 100);
+    triggerCapture(false);
   });
+
+  if (perfectRenderBtn) {
+    perfectRenderBtn.addEventListener('click', () => {
+      triggerCapture(true);
+    });
+  }
+
+  const exportGlbBtn = document.getElementById('export-glb-btn');
+  if (exportGlbBtn) {
+    exportGlbBtn.addEventListener('click', () => {
+      const spinner = document.getElementById('spinner');
+      if (spinner) spinner.classList.remove('hidden');
+      showToast('📦 Exporting 3D scene to GLB for Blender...');
+      
+      setTimeout(() => {
+        try {
+          const exporter = new GLTFExporter();
+          
+          // Hide editor outline helpers temporarily
+          const originalGridVisible = gridHelper ? gridHelper.visible : false;
+          if (gridHelper) gridHelper.visible = false;
+          if (window._axesHelper) window._axesHelper.visible = false;
+          if (selectionBox) selectionBox.visible = false;
+          
+          const options = {
+            binary: true,
+            animations: [],
+            truncateDrawRange: true
+          };
+          
+          exporter.parse(
+            scene,
+            (gltf) => {
+              // Restore editor outline helpers
+              if (gridHelper) gridHelper.visible = originalGridVisible;
+              if (window._axesHelper) window._axesHelper.visible = state.showGrid;
+              if (selectionBox) selectionBox.visible = true;
+              
+              // Trigger browser download
+              const blob = new Blob([gltf], { type: 'application/octet-stream' });
+              const link = document.createElement('a');
+              link.download = `BookStudio3D_Scene_${state.bookType}_${Date.now()}.glb`;
+              link.href = URL.createObjectURL(blob);
+              link.click();
+              
+              showToast('🎉 Scene exported! Open Blender, go to File -> Import -> glTF 2.0.');
+              if (spinner) spinner.classList.add('hidden');
+            },
+            (err) => {
+              console.error(err);
+              showToast('❌ GLB export failed.');
+              if (spinner) spinner.classList.add('hidden');
+            },
+            options
+          );
+        } catch (e) {
+          console.error(e);
+          showToast('❌ GLB export failed.');
+          if (spinner) spinner.classList.add('hidden');
+        }
+      }, 100);
+    });
+  }
   
   // Composites the WebGL canvas, backdrop photo, and foreground hands overlay into a single image
   function compositeAndDownload(webglCanvas, targetW, targetH, callback) {
@@ -2324,8 +3545,8 @@ document.addEventListener('DOMContentLoaded', () => {
         
         compCtx.drawImage(bgImg, sx, sy, sWidth, sHeight, 0, 0, targetW, targetH);
         
-        // Draw WebGL book (including shadow catcher floor/wall) on top
-        compCtx.drawImage(webglCanvas, 0, 0);
+        // Draw WebGL book (including shadow catcher floor/wall) on top with proper scaling
+        compCtx.drawImage(webglCanvas, 0, 0, targetW, targetH);
         
         // Draw foreground fingers cutout on top if active
         const overlayImg = document.getElementById('foreground-overlay');
@@ -2349,8 +3570,8 @@ document.addEventListener('DOMContentLoaded', () => {
         compCtx.fillRect(0, 0, targetW, targetH);
       }
       
-      // Draw WebGL book canvas
-      compCtx.drawImage(webglCanvas, 0, 0);
+      // Draw WebGL book canvas with proper scaling
+      compCtx.drawImage(webglCanvas, 0, 0, targetW, targetH);
       triggerDownload();
     }
   }
@@ -2401,6 +3622,10 @@ document.addEventListener('DOMContentLoaded', () => {
     if (hits.length > 0) {
       const found = findTopGroup(hits[0].object);
       if (found) {
+        if (found.group.userData.locked) {
+          showToast(`🔒 ${found.name} is locked. Unlock in outliner to drag.`);
+          return;
+        }
         dragTarget = found.group;
         dragTargetLabel = found.name;
         dragPlane.setFromNormalAndCoplanarPoint(new THREE.Vector3(0,1,0), dragTarget.position);
@@ -2502,6 +3727,201 @@ document.addEventListener('DOMContentLoaded', () => {
   }, { passive: false });
   canvas.addEventListener('touchend', () => { pinchObj = null; });
 
+  // --- CONFIG IMPORT / EXPORT SYSTEM ---
+  function exportConfig() {
+    try {
+      const data = {
+        state: {
+          bookType: state.bookType,
+          width: state.width,
+          height: state.height,
+          spineWidth: state.spineWidth,
+          pages: state.pages,
+          coverFinish: state.coverFinish,
+          paperColor: state.paperColor,
+          pageEdgeStyle: state.pageEdgeStyle,
+          customEdgeColor: state.customEdgeColor,
+          preset: state.preset,
+          lightIntensity: state.lightIntensity,
+          lightRotation: state.lightRotation,
+          shadowSoftness: state.shadowSoftness,
+          dof: state.dof,
+          fov: state.fov,
+          showGrid: state.showGrid,
+          exportBg: state.exportBg,
+          exportScale: state.exportScale,
+          coverImageSrc: state.coverImageSrc
+        },
+        objects: {}
+      };
+      
+      // Save book group transform
+      if (bookGroup) {
+        data.objects.book = {
+          px: bookGroup.position.x, py: bookGroup.position.y, pz: bookGroup.position.z,
+          rx: bookGroup.rotation.x, ry: bookGroup.rotation.y, rz: bookGroup.rotation.z,
+          s: bookGroup.scale.x, visible: bookGroup.visible,
+          locked: !!bookGroup.userData.locked
+        };
+      }
+      
+      // Save prop transforms
+      loadedProps.forEach(p => {
+        data.objects[p.name.toLowerCase()] = {
+          px: p.group.position.x, py: p.group.position.y, pz: p.group.position.z,
+          rx: p.group.rotation.x, ry: p.group.rotation.y, rz: p.group.rotation.z,
+          s: p.group.scale.x, visible: p.group.visible,
+          locked: !!p.group.userData.locked
+        };
+      });
+      
+      const jsonStr = JSON.stringify(data, null, 2);
+      const blob = new Blob([jsonStr], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      
+      const link = document.createElement('a');
+      link.download = `BookStudio3D_Config_${Date.now()}.json`;
+      link.href = url;
+      link.click();
+      
+      URL.revokeObjectURL(url);
+      showToast('📤 Scene config exported successfully!');
+    } catch (err) {
+      console.error(err);
+      showToast('❌ Failed to export config.');
+    }
+  }
+
+  function importConfig(data) {
+    if (!data || !data.state) {
+      showToast('❌ Invalid config file.');
+      return;
+    }
+    
+    spinner.classList.remove('hidden');
+    showToast('📥 Importing scene config...');
+    
+    setTimeout(() => {
+      try {
+        // 1. Restore state
+        Object.assign(state, data.state);
+        
+        // 2. Sync UI sliders/inputs
+        document.querySelectorAll('input[name="book-type"]').forEach(r => {
+          r.checked = r.value === state.bookType;
+        });
+        document.getElementById('input-width').value = state.width;
+        document.getElementById('input-height').value = state.height;
+        document.getElementById('input-spine').value = state.spineWidth;
+        document.getElementById('spine-val').textContent = state.spineWidth.toFixed(3) + '"';
+        document.getElementById('input-pages').value = state.pages;
+        document.getElementById('pages-val').textContent = state.pages;
+        document.getElementById('select-finish').value = state.coverFinish;
+        document.getElementById('select-paper').value = state.paperColor;
+        document.querySelectorAll('.edge-dot').forEach(d => {
+          d.classList.toggle('active', d.dataset.edge === state.pageEdgeStyle);
+          d.style.border = d.dataset.edge === state.pageEdgeStyle ? '2px solid #7c3aed' : '';
+        });
+        document.getElementById('input-edge-color').value = state.customEdgeColor;
+        document.getElementById('input-light-intensity').value = state.lightIntensity;
+        document.getElementById('intensity-val').textContent = state.lightIntensity.toFixed(1) + 'x';
+        document.getElementById('input-light-rotation').value = state.lightRotation;
+        document.getElementById('rotation-val').textContent = state.lightRotation + '°';
+        document.getElementById('input-shadow-softness').value = state.shadowSoftness;
+        const ss = state.shadowSoftness;
+        const ssText = ss < 0.2 ? 'Ultra Sharp' : ss < 0.4 ? 'Sharp' : ss > 1.0 ? 'Very Soft' : ss > 0.7 ? 'Soft' : 'Medium';
+        document.getElementById('shadow-val').textContent = ssText;
+        document.getElementById('input-fov').value = state.fov;
+        const fovTxt = state.fov < 30 ? `${state.fov}° (Telephoto)` : state.fov > 55 ? `${state.fov}° (Wide Angle)` : `${state.fov}° (Portrait)`;
+        document.getElementById('fov-val').textContent = fovTxt;
+        if (camera) { camera.fov = state.fov; camera.updateProjectionMatrix(); }
+        const dofEl = document.getElementById('input-dof');
+        if (dofEl) { dofEl.value = state.dof; document.getElementById('dof-val').textContent = state.dof > 0 ? state.dof + '%' : 'Off'; }
+        document.getElementById('select-export-bg').value = state.exportBg;
+        document.getElementById('select-export-scale').value = String(state.exportScale);
+        document.querySelectorAll('.preset-card').forEach(c => {
+          c.classList.toggle('active', c.dataset.preset === state.preset);
+        });
+        const tgBtn = document.getElementById('toggle-grid-btn');
+        if (tgBtn) tgBtn.classList.toggle('active', !!state.showGrid);
+        if (gridHelper) gridHelper.visible = state.showGrid;
+        if (window._axesHelper) window._axesHelper.visible = state.showGrid;
+        
+        // 3. Rebuild preset environment
+        applyPreset();
+        
+        // 4. Load cover image if saved
+        if (data.state.coverImageSrc) {
+          loadCoverImage(data.state.coverImageSrc);
+        } else {
+          state.coverImage = null;
+          state.coverImageSrc = null;
+          if (state.frontTexture) state.frontTexture.dispose();
+          if (state.spineTexture) state.spineTexture.dispose();
+          if (state.backTexture) state.backTexture.dispose();
+          if (state.frontHingeTexture) state.frontHingeTexture.dispose();
+          if (state.backHingeTexture) state.backHingeTexture.dispose();
+          state.frontTexture = null;
+          state.spineTexture = null;
+          state.backTexture = null;
+          state.frontHingeTexture = null;
+          state.backHingeTexture = null;
+          document.getElementById('cover-preview-img').src = '';
+          document.getElementById('cover-preview-wrapper').classList.add('hidden');
+          document.getElementById('drop-zone').classList.remove('hidden');
+          document.getElementById('cover-upload').value = '';
+          rebuildBook();
+        }
+        
+        // 5. Restore object transforms
+        applySavedTransforms(data);
+        
+        // 6. Save configuration to localStorage so it persists
+        saveSettings();
+        
+        spinner.classList.add('hidden');
+        showToast('🎉 Scene config imported successfully!');
+      } catch (err) {
+        console.error(err);
+        spinner.classList.add('hidden');
+        showToast('❌ Error applying scene config data.');
+      }
+    }, 100);
+  }
+
+  // Bind config buttons click events
+  if (exportConfigBtn) {
+    exportConfigBtn.addEventListener('click', () => {
+      exportConfig();
+    });
+  }
+  
+  if (importConfigBtn) {
+    importConfigBtn.addEventListener('click', () => {
+      importConfigFile.click();
+    });
+  }
+  
+  if (importConfigFile) {
+    importConfigFile.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        try {
+          const json = JSON.parse(event.target.result);
+          importConfig(json);
+        } catch (err) {
+          console.error(err);
+          showToast('❌ Failed to parse config JSON file.');
+        }
+      };
+      reader.readAsText(file);
+      importConfigFile.value = ''; // Reset input
+    });
+  }
+
   // Toast notifier
   function showToast(msg) {
     const toast = document.getElementById('toast');
@@ -2510,5 +3930,12 @@ document.addEventListener('DOMContentLoaded', () => {
     toast.classList.add('show');
     if (toast.timeoutId) clearTimeout(toast.timeoutId);
     toast.timeoutId = setTimeout(() => { toast.classList.remove('show'); }, 3500);
+  }
+
+  // On startup: load the saved cover image or auto-load the default demo cover
+  if (state.coverImageSrc) {
+    loadCoverImage(state.coverImageSrc);
+  } else {
+    loadCoverImage('agi-question.png');
   }
 });
